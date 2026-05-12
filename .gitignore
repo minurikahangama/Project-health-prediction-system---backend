@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==========================================
+# PHPS Custom Academic Project Overrides
+# ==========================================
+
+# Local Environment & Secrets
+.env
+.env.local
+
+# Local Data Drops (Contains sensitive raw text - MUST NEVER BE UPLOADED)
+data_raw/
+data/raw/
+*.vtt
+*.txt
+*.csv
+
+# Local Database Files
+*.db
+*.sqlite3

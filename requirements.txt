@@ -1,0 +1,34 @@
+# ── Web Framework ─────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+python-dotenv==1.0.1
+
+# ── Database ───────────────────────────────────────────────────
+sqlalchemy==2.0.30
+alembic==1.13.1
+psycopg2-binary==2.9.9
+
+# ── Authentication ─────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# ── ML / NLP ───────────────────────────────────────────────────
+torch==2.3.0
+transformers==4.41.0
+spacy==3.7.4
+xgboost==2.0.3
+scikit-learn==1.5.0
+numpy==1.26.4
+pandas==2.2.2
+optuna==3.6.1
+
+# ── HTTP client (for Jira API calls) ──────────────────────────
+httpx==0.27.0
+
+# ── Security / Encryption ─────────────────────────────────────
+cryptography==42.0.7
+slowapi==0.1.9
+
+# ── Utilities ─────────────────────────────────────────────────
+python-dateutil==2.9.0

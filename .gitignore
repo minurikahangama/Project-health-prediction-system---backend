@@ -1,0 +1,34 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment secrets — NEVER commit
+.env
+*.key
+
+# ML model weights (too large — store on Google Drive)
+app/ml/inference/roberta_phps/
+app/ml/inference/*.bin
+app/ml/inference/*.pt
+app/ml/inference/*.safetensors
+app/ml/inference/xgb_model.json
+
+# Raw data — GDPR: never commit
+data_raw/
+*.vtt
+
+# Database files
+*.db
+*.sqlite3
+
+# IDE settings
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Node (if you add frontend later)
+node_modules/

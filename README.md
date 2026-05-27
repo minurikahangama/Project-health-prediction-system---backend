@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # PHPS Backend — Setup Guide
 
 ## Quick Start (5 steps)
@@ -129,3 +130,7 @@ If not present, a rule-based scoring formula is used as fallback.
 | POST | /admin/users | Create PM or Org Admin account |
 | GET | /admin/export-research | Download anonymised research CSV |
 | WS | /ws/{project_id} | Real-time health score updates |
+=======
+# phps-research
+Software project health prediction using communication sentiments and jira delivery signals.This focuses on predicting software project failures earlt before they escalate using AI by combining human and technical factors
+>>>>>>> 989d2d25c773dd4bd6d60235f6016fceba386093

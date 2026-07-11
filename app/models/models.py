@@ -21,8 +21,8 @@ from sqlalchemy import (
     DateTime, ForeignKey, Text
 )
 from sqlalchemy.orm import relationship
-from datetime import datetime
 from app.utils.database import Base
+from app.utils.time import utcnow
 
 
 class Organisation(Base):
@@ -31,7 +31,7 @@ class Organisation(Base):
     id         = Column(Integer, primary_key=True, index=True)
     name       = Column(String(255), unique=True, nullable=False)
     industry   = Column(String(100), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
 
     # Relationships
     users    = relationship("User",    back_populates="organisation",
@@ -60,7 +60,7 @@ class User(Base):
     force_password_change  = Column(Boolean, default=False)
     # force_password_change=True on first login for new accounts created by admins
     last_login             = Column(DateTime, nullable=True)
-    created_at             = Column(DateTime, default=datetime.utcnow)
+    created_at             = Column(DateTime, default=utcnow)
 
     # Relationships
     organisation = relationship("Organisation", back_populates="users")
@@ -104,7 +104,7 @@ class Project(Base):
     # PM note shown on client dashboard
     pm_note               = Column(Text, nullable=True)
 
-    created_at            = Column(DateTime, default=datetime.utcnow)
+    created_at            = Column(DateTime, default=utcnow)
 
     # Relationships
     organisation  = relationship("Organisation",    back_populates="projects")
@@ -144,7 +144,7 @@ class HealthScore(Base):
     bug_ratio        = Column(Float, nullable=False)     # Jira [0.0, 1.0]
     divergence_flag  = Column(Integer, default=0)        # 0 or 1 — NOT Boolean
 
-    recorded_at      = Column(DateTime, default=datetime.utcnow, index=True)
+    recorded_at      = Column(DateTime, default=utcnow, index=True)
 
     # Relationship
     project = relationship("Project", back_populates="health_scores")
@@ -174,7 +174,7 @@ class ClientShareToken(Base):
                                   nullable=True)
     revoked             = Column(Boolean, default=False)
     last_accessed       = Column(DateTime, nullable=True)
-    created_at          = Column(DateTime, default=datetime.utcnow)
+    created_at          = Column(DateTime, default=utcnow)
 
     # Relationships
     project    = relationship("Project", back_populates="share_tokens")
@@ -202,7 +202,7 @@ class GDPRDeletionLog(Base):
                                 nullable=False)
     confirmation_hash = Column(String(64), nullable=False)
     # SHA-256 hash of the raw text before deletion — proof of deletion
-    deleted_at        = Column(DateTime, default=datetime.utcnow, index=True)
+    deleted_at        = Column(DateTime, default=utcnow, index=True)
 
     # Relationship
     project = relationship("Project", back_populates="gdpr_logs")

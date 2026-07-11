@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from app.utils.database import get_db
 from app.models.models import User
-from datetime import datetime, timedelta
+from app.utils.time import utcnow
+from datetime import timedelta
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 import os
@@ -46,7 +47,7 @@ class ChangePasswordRequest(BaseModel):
 
 def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
     payload = data.copy()
-    expire  = datetime.utcnow() + (expires_delta or timedelta(minutes=EXPIRE_MIN))
+    expire  = utcnow() + (expires_delta or timedelta(minutes=EXPIRE_MIN))
     payload.update({"exp": expire})
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -130,7 +131,7 @@ def login(
         raise HTTPException(status_code=403, detail="Account deactivated")
 
     # Update last login timestamp
-    user.last_login = datetime.utcnow()
+    user.last_login = utcnow()
     db.commit()
 
     token = create_access_token({

@@ -14,7 +14,7 @@ NFR-16: Client endpoint returns ONLY 6 safe fields — never raw ML signals
 """
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -24,6 +24,7 @@ from typing import Optional
 from app.utils.database import get_db
 from app.api.auth import get_current_user, require_role
 from app.models.models import ClientShareToken, HealthScore, Project, User
+from app.utils.time import utcnow
 
 router = APIRouter()
 
@@ -76,7 +77,7 @@ def generate_share_link(
 
     # Compute expiry
     expiry = (
-        datetime.utcnow() + timedelta(days=body.days)
+        utcnow() + timedelta(days=body.days)
         if body.days > 0
         else None
     )
@@ -149,7 +150,7 @@ def get_link_status(
         return {"has_active_link": False}
 
     # Check expiry
-    if active.expiry_date and active.expiry_date < datetime.utcnow():
+    if active.expiry_date and active.expiry_date < utcnow():
         return {"has_active_link": False}
 
     return {
@@ -185,7 +186,7 @@ def get_client_view(
     if not record:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    if record.expiry_date and record.expiry_date < datetime.utcnow():
+    if record.expiry_date and record.expiry_date < utcnow():
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Fetch latest health score
@@ -218,7 +219,7 @@ def get_client_view(
     ]
 
     # Update last accessed timestamp for audit log
-    record.last_accessed = datetime.utcnow()
+    record.last_accessed = utcnow()
     db.commit()
 
     # NFR-16: ONLY these 6 fields — NEVER tone_score, velocity, overdue, bug_ratio, urgency

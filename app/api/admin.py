@@ -20,7 +20,6 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
-from datetime import datetime
 from passlib.context import CryptContext
 import io
 import csv
@@ -30,6 +29,7 @@ from app.api.auth import get_current_user, require_role
 from app.models.models import (
     Organisation, User, Project, HealthScore, ClientShareToken
 )
+from app.utils.time import utcnow
 
 router   = APIRouter()
 pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -258,7 +258,7 @@ def get_share_link_audit(
         query = query.filter(ClientShareToken.revoked == True)
 
     tokens = query.order_by(ClientShareToken.created_at.desc()).all()
-    now    = datetime.utcnow()
+    now    = utcnow()
 
     result = []
     for t in tokens:
@@ -314,7 +314,7 @@ def get_system_health(
         "total_projects":   total_projects,
         "total_scores":     total_scores,
         "last_ingestion":   latest_score.recorded_at.isoformat() if latest_score else None,
-        "checked_at":       datetime.utcnow().isoformat(),
+        "checked_at":       utcnow().isoformat(),
     }
 
 
@@ -362,7 +362,7 @@ def export_research_csv(
         ])
 
     output.seek(0)
-    filename = f"phps_research_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"phps_research_export_{utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
 
     return StreamingResponse(
         iter([output.getvalue()]),

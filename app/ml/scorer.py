@@ -24,6 +24,11 @@ MODEL_PATH = os.path.join(_BASE_DIR, "inference", "xgb_model.json")
 
 _model = None
 
+
+def _normalise_tone(tone_score: float) -> float:
+    """Convert the public sentiment range [-1, 1] to the model's [0, 1]."""
+    return max(0.0, min(1.0, (float(tone_score) + 1.0) / 2.0))
+
 def _get_model():
     """Lazy-load XGBoost model on first call."""
     global _model
@@ -31,7 +36,11 @@ def _get_model():
         if os.path.isfile(MODEL_PATH):
             try:
                 import xgboost as xgb
-                m = xgb.XGBClassifier()
+                # train_xgboost.py creates an XGBRegressor whose target is a
+                # health score from 0 to 100.  Loading it as a classifier
+                # raises "Expecting: classifier, got: regressor", which made
+                # the application silently use the rule-based fallback.
+                m = xgb.XGBRegressor()
                 m.load_model(MODEL_PATH)
                 _model = m
                 logger.info(f"Loaded XGBoost model from: {MODEL_PATH}")
@@ -118,13 +127,17 @@ def compute_health_score(
     model = _get_model()
 
     if model is not None:
-        # XGBoost model available — use trained classifier
-        features    = np.array([[tone_score, urgency_flag,
-                                  velocity_percent, overdue_rate, bug_ratio]])
-        # predict_proba returns [[prob_class_0, prob_class_1]]
-        # class 1 = Healthy → use as health score
-        prob_healthy = float(model.predict_proba(features)[0][1])
-        score        = round(prob_healthy * 100.0, 2)
+        # The trained regressor expects all five inputs in the [0, 1] range.
+        # score_tone() exposes sentiment as [-1, 1], so normalise it before
+        # inference to match the feature range used during training.
+        features = np.array([[
+            _normalise_tone(tone_score),
+            max(0.0, min(1.0, float(urgency_flag))),
+            max(0.0, min(1.0, float(velocity_percent))),
+            max(0.0, min(1.0, float(overdue_rate))),
+            max(0.0, min(1.0, float(bug_ratio))),
+        ]])
+        score = round(float(model.predict(features)[0]), 2)
     else:
         # Fallback to rule-based scoring
         score = round(

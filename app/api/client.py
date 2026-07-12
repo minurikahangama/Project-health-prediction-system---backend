@@ -37,12 +37,14 @@ def _hash_token(raw_token: str) -> str:
 
 
 def _get_project_for_pm(project_id: int, user: User, db: Session) -> Project:
-    """Fetch a project ensuring it belongs to the user's org."""
+    """Fetch a project accessible to the assigned PM or organisation admin."""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if project.org_id != user.org_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    if user.role == "pm" and project.created_by_user_id != user.id:
+        raise HTTPException(status_code=403, detail="This project is not assigned to you")
     return project
 
 
@@ -59,7 +61,7 @@ def generate_share_link(
     project_id: int,
     body: ShareLinkRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("pm")),
+    current_user: User = Depends(require_role("pm", "org_admin")),
 ):
     """
     Generate a new 256-bit secure share link for the client dashboard.
@@ -102,7 +104,9 @@ def generate_share_link(
     frontend_url = __import__("os").getenv("FRONTEND_URL", "http://localhost:5173")
 
     return {
+        "token":     raw_token,
         "share_url": f"{frontend_url}/client/{raw_token}",
+        "expires_at": expiry.isoformat() if expiry else None,
         "expires":   expiry.isoformat() if expiry else "Never",
         "message":   "Share link generated. Send this URL to your client.",
     }
@@ -112,7 +116,7 @@ def generate_share_link(
 def revoke_share_link(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("pm")),
+    current_user: User = Depends(require_role("pm", "org_admin")),
 ):
     """
     Revoke all active share tokens for a project.
@@ -136,7 +140,7 @@ def revoke_share_link(
 def get_link_status(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("pm")),
+    current_user: User = Depends(require_role("pm", "org_admin")),
 ):
     """Check whether an active share link exists for this project."""
     _get_project_for_pm(project_id, current_user, db)

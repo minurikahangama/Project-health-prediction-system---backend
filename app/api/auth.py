@@ -136,6 +136,8 @@ def login(
 
     token = create_access_token({
         "sub":                  user.email,
+        "user_id":              user.id,
+        "name":                 user.name,
         "role":                 user.role,
         "org_id":               user.org_id,
         "force_password_change": user.force_password_change,
@@ -190,6 +192,8 @@ def change_password(
     # Issue a new token without the force_password_change flag
     token = create_access_token({
         "sub":                  current_user.email,
+        "user_id":              current_user.id,
+        "name":                 current_user.name,
         "role":                 current_user.role,
         "org_id":               current_user.org_id,
         "force_password_change": False,

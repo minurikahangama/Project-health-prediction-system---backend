@@ -35,12 +35,14 @@ class ProjectCreate(BaseModel):
     start_date:       datetime
     deadline:         datetime
     team_size:        int
-    jira_url:         Optional[str] = None
+    jira_project_url: Optional[str] = None
     jira_api_token:   Optional[str] = None   # plaintext — encrypted before DB write
     jira_email:       Optional[str] = None
     gmail_filter_email: Optional[str] = None
+    gmail_project_identifier: Optional[str] = None
     green_threshold:  float = 70.0
     red_threshold:    float = 40.0
+    assigned_pm_id:    Optional[int] = None
 
     @validator("deadline")
     def deadline_after_start(cls, v, values):
@@ -63,11 +65,16 @@ class ProjectCreate(BaseModel):
 
 class ProjectUpdate(BaseModel):
     name:              Optional[str]    = None
+    start_date:        Optional[datetime] = None
     deadline:          Optional[datetime] = None
     team_size:         Optional[int]    = None
     green_threshold:   Optional[float]  = None
     red_threshold:     Optional[float]  = None
     gmail_filter_email: Optional[str]   = None
+    gmail_project_identifier: Optional[str] = None
+    jira_project_url:  Optional[str]    = None
+    jira_email:        Optional[str]    = None
+    jira_api_token:    Optional[str]    = None  # encrypted before DB write
 
 
 class PMNoteUpdate(BaseModel):
@@ -81,7 +88,7 @@ class PMNoteUpdate(BaseModel):
 
 
 class JiraTestRequest(BaseModel):
-    jira_url:       str
+    jira_project_url: str
     jira_email:     str
     jira_api_token: str
 
@@ -94,7 +101,61 @@ def _get_project_for_user(project_id: int, user: User, db: Session) -> Project:
         raise HTTPException(status_code=404, detail="Project not found")
     if project.org_id != user.org_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    if user.role == "pm" and project.created_by_user_id != user.id:
+        raise HTTPException(status_code=403, detail="This project is not assigned to you")
     return project
+
+
+def _project_response(project: Project, latest: Optional[HealthScore] = None) -> dict:
+    """Serialize the public project shape used by all project endpoints."""
+    return {
+        "id": project.id,
+        "name": project.name,
+        "start_date": project.start_date.isoformat(),
+        "deadline": project.deadline.isoformat(),
+        "team_size": project.team_size,
+        "jira_project_url": project.jira_url,
+        "jira_email": project.jira_email,
+        "jira_connected": bool(project.encrypted_jira_token),
+        "gmail_connected": bool(project.encrypted_gmail_token),
+        "gmail_filter_email": project.gmail_filter_email,
+        "gmail_project_identifier": project.gmail_project_identifier,
+        "green_threshold": project.green_threshold,
+        "red_threshold": project.red_threshold,
+        "pm_note": project.pm_note,
+        "assigned_pm_id": project.created_by_user_id,
+        "assigned_pm_name": project.pm.name if project.pm else None,
+        "health_score": latest.health_score if latest else None,
+        "rag_status": latest.rag_status if latest else None,
+        "divergence_flag": latest.divergence_flag if latest else 0,
+        "velocity_percent": latest.velocity_percent if latest else None,
+        "overdue_rate": latest.overdue_rate if latest else None,
+        "bug_ratio": latest.bug_ratio if latest else None,
+        "recorded_at": latest.recorded_at.isoformat() if latest else None,
+    }
+
+
+def _create_initial_health_score(project: Project) -> HealthScore:
+    """Provide the required unmeasured state until the first data sync."""
+    return HealthScore(
+        project_id=project.id,
+        health_score=0.0,
+        rag_status="RED",
+        tone_score=0.0,
+        urgency_flag=0,
+        velocity_percent=0.0,
+        overdue_rate=0.0,
+        bug_ratio=0.0,
+        divergence_flag=0,
+    )
+
+
+def _rag_for_score(score: float, green_threshold: float, red_threshold: float) -> str:
+    if score >= green_threshold:
+        return "GREEN"
+    if score < red_threshold:
+        return "RED"
+    return "AMBER"
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -105,12 +166,10 @@ def list_projects(
     current_user: User = Depends(get_current_user),
 ):
     """Return all projects in the current user's organisation."""
-    projects = (
-        db.query(Project)
-        .filter(Project.org_id == current_user.org_id)
-        .order_by(Project.created_at.desc())
-        .all()
-    )
+    query = db.query(Project).filter(Project.org_id == current_user.org_id)
+    if current_user.role == "pm":
+        query = query.filter(Project.created_by_user_id == current_user.id)
+    projects = query.order_by(Project.created_at.desc()).all()
 
     result = []
     for p in projects:
@@ -121,21 +180,7 @@ def list_projects(
             .order_by(HealthScore.recorded_at.desc())
             .first()
         )
-        result.append({
-            "id":               p.id,
-            "name":             p.name,
-            "deadline":         p.deadline.isoformat(),
-            "team_size":        p.team_size,
-            "green_threshold":  p.green_threshold,
-            "red_threshold":    p.red_threshold,
-            "health_score":     latest.health_score     if latest else None,
-            "rag_status":       latest.rag_status       if latest else None,
-            "velocity_percent": latest.velocity_percent if latest else None,
-            "overdue_rate":     latest.overdue_rate     if latest else None,
-            "bug_ratio":        latest.bug_ratio        if latest else None,
-            "divergence_flag":  latest.divergence_flag  if latest else 0,
-            "recorded_at":      latest.recorded_at.isoformat() if latest else None,
-        })
+        result.append(_project_response(p, latest))
     return result
 
 
@@ -143,31 +188,59 @@ def list_projects(
 def create_project(
     data: ProjectCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("pm")),
+    current_user: User = Depends(require_role("pm", "org_admin")),
 ):
-    """Create a new project. Only PMs can create projects."""
+    """Create a project and assign it to a PM in the current organisation."""
+    if not (data.jira_project_url and data.jira_email and data.jira_api_token):
+        raise HTTPException(
+            status_code=400,
+            detail="Jira URL, account email, and API token must be validated before creating a project.",
+        )
+    # Repeat the wizard validation at the write boundary so a client cannot
+    # bypass it and save unverified credentials.
+    _validate_jira_connection(
+        data.jira_project_url, data.jira_email, data.jira_api_token
+    )
     # Encrypt Jira token before storage
     enc_jira = encrypt_token(data.jira_api_token) if data.jira_api_token else None
 
+    assigned_pm_id = current_user.id
+    if current_user.role == "org_admin":
+        if not data.assigned_pm_id:
+            raise HTTPException(status_code=400, detail="Select a project manager to assign this project")
+        assignee = db.query(User).filter(
+            User.id == data.assigned_pm_id,
+            User.org_id == current_user.org_id,
+            User.role == "pm",
+            User.is_active == True,
+        ).first()
+        if not assignee:
+            raise HTTPException(status_code=400, detail="Selected project manager is not active in your organisation")
+        assigned_pm_id = assignee.id
+
     project = Project(
         org_id               = current_user.org_id,
-        created_by_user_id   = current_user.id,
+        created_by_user_id   = assigned_pm_id,
         name                 = data.name,
         start_date           = data.start_date,
         deadline             = data.deadline,
         team_size            = data.team_size,
-        jira_url             = data.jira_url,
+        jira_url             = data.jira_project_url,
         encrypted_jira_token = enc_jira,
         jira_email           = data.jira_email,
         gmail_filter_email   = data.gmail_filter_email,
+        gmail_project_identifier = data.gmail_project_identifier,
         green_threshold      = data.green_threshold,
         red_threshold        = data.red_threshold,
     )
     db.add(project)
+    db.flush()
+    # Zero is an explicit "not measured" state, never an estimate.
+    db.add(_create_initial_health_score(project))
     db.commit()
     db.refresh(project)
 
-    return {"id": project.id, "name": project.name, "message": "Project created"}
+    return _project_response(project)
 
 
 @router.get("/{project_id}")
@@ -178,21 +251,9 @@ def get_project(
 ):
     """Get full project details (excluding encrypted tokens)."""
     project = _get_project_for_user(project_id, current_user, db)
-    return {
-        "id":                  project.id,
-        "name":                project.name,
-        "start_date":          project.start_date.isoformat(),
-        "deadline":            project.deadline.isoformat(),
-        "team_size":           project.team_size,
-        "jira_url":            project.jira_url,
-        "jira_email":          project.jira_email,
-        "jira_connected":      bool(project.encrypted_jira_token),
-        "gmail_connected":     bool(project.encrypted_gmail_token),
-        "gmail_filter_email":  project.gmail_filter_email,
-        "green_threshold":     project.green_threshold,
-        "red_threshold":       project.red_threshold,
-        "pm_note":             project.pm_note,
-    }
+    latest = (db.query(HealthScore).filter(HealthScore.project_id == project.id)
+              .order_by(HealthScore.recorded_at.desc()).first())
+    return _project_response(project, latest)
 
 
 @router.patch("/{project_id}")
@@ -205,8 +266,22 @@ def update_project(
     """Update project details or RAG thresholds."""
     project = _get_project_for_user(project_id, current_user, db)
 
+    next_start_date = data.start_date or project.start_date
+    next_deadline = data.deadline or project.deadline
+    if next_deadline <= next_start_date:
+        raise HTTPException(status_code=400, detail="Deadline must be after the start date")
+    next_green = data.green_threshold if data.green_threshold is not None else project.green_threshold
+    next_red = data.red_threshold if data.red_threshold is not None else project.red_threshold
+    if not (0 < next_red < next_green <= 100):
+        raise HTTPException(
+            status_code=400,
+            detail="Red threshold must be greater than 0 and lower than the Green threshold (maximum 100).",
+        )
+
     if data.name is not None:
         project.name = data.name
+    if data.start_date is not None:
+        project.start_date = data.start_date
     if data.deadline is not None:
         project.deadline = data.deadline
     if data.team_size is not None:
@@ -215,11 +290,30 @@ def update_project(
         project.green_threshold = data.green_threshold
     if data.red_threshold is not None:
         project.red_threshold = data.red_threshold
+
+    # Thresholds classify the score, so changing them must immediately update
+    # the current and historical RAG statuses—not only future pipeline runs.
+    if data.green_threshold is not None or data.red_threshold is not None:
+        for score_row in db.query(HealthScore).filter(HealthScore.project_id == project.id):
+            score_row.rag_status = _rag_for_score(
+                score_row.health_score, next_green, next_red
+            )
     if data.gmail_filter_email is not None:
         project.gmail_filter_email = data.gmail_filter_email
+    if data.gmail_project_identifier is not None:
+        project.gmail_project_identifier = data.gmail_project_identifier.strip() or None
+    if data.jira_project_url is not None:
+        project.jira_url = data.jira_project_url
+    if data.jira_email is not None:
+        project.jira_email = data.jira_email
+    if data.jira_api_token:
+        project.encrypted_jira_token = encrypt_token(data.jira_api_token)
 
     db.commit()
-    return {"message": "Project updated"}
+    db.refresh(project)
+    latest = (db.query(HealthScore).filter(HealthScore.project_id == project.id)
+              .order_by(HealthScore.recorded_at.desc()).first())
+    return _project_response(project, latest)
 
 
 @router.delete("/{project_id}")
@@ -227,7 +321,7 @@ def delete_project(
     project_id: int,
     confirm_name: str,          # must match project name exactly
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("pm")),
+    current_user: User = Depends(require_role("pm", "org_admin")),
 ):
     """Delete a project. Requires typing the project name as confirmation."""
     project = _get_project_for_user(project_id, current_user, db)
@@ -262,10 +356,11 @@ def get_health_score(
         .first()
     )
     if not latest:
-        raise HTTPException(
-            status_code=404,
-            detail="No health score data yet. Connect Jira and wait for the first sync.",
-        )
+        # Backfill older projects with the same unmeasured state.
+        latest = _create_initial_health_score(project)
+        db.add(latest)
+        db.commit()
+        db.refresh(latest)
 
     # History for charts — ascending order so charts render left → right
     history_rows = (
@@ -279,8 +374,9 @@ def get_health_score(
     history = [
         {
             "date":             row.recorded_at.strftime("%b %d"),
-            "health_score":     row.health_score,
-            "tone_score":       row.tone_score,
+            "recorded_at":      row.recorded_at.isoformat(),
+            "score":            row.health_score,
+            "tone":             row.tone_score,
             "velocity_percent": row.velocity_percent,
         }
         for row in history_rows
@@ -314,7 +410,7 @@ def update_pm_note(
     project_id: int,
     body: PMNoteUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("pm")),
+    current_user: User = Depends(require_role("pm", "org_admin")),
 ):
     """Update the PM note shown on the client dashboard."""
     project = _get_project_for_user(project_id, current_user, db)
@@ -323,21 +419,61 @@ def update_pm_note(
     return {"message": "PM note saved"}
 
 
+@router.post("/{project_id}/sync-jira")
+def sync_jira_now(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("pm", "org_admin")),
+):
+    """Fetch Jira signals now and create a fresh health-score record."""
+    project = _get_project_for_user(project_id, current_user, db)
+    if not project.jira_url or not project.encrypted_jira_token:
+        raise HTTPException(status_code=400, detail="Jira is not configured for this project")
+
+    from app.api.pipeline import sync_jira_project
+
+    try:
+        return sync_jira_project(db, project)
+    except JiraSignalError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/sync-gmail")
+def sync_gmail_now(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("pm", "org_admin")),
+):
+    """Poll the monitored Gmail inbox now, for an auditable integration test."""
+    project = _get_project_for_user(project_id, current_user, db)
+    from app.api.pipeline import sync_gmail_project
+    from app.services.gmail_ingestion import GmailIngestionError
+
+    try:
+        return sync_gmail_project(db, project)
+    except GmailIngestionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.post("/test-jira")
 def test_jira_connection(
     body: JiraTestRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Test a Jira connection before saving it.
-    Called from New Project Wizard Step 2 before Continue button is enabled.
-    """
+    """Test a Jira connection before saving it."""
+    return _validate_jira_connection(
+        body.jira_project_url, body.jira_email, body.jira_api_token
+    )
+
+
+def _validate_jira_connection(jira_project_url: str, jira_email: str, jira_api_token: str) -> dict:
+    """Validate Jira credentials without persisting either secret."""
     try:
-        url  = body.jira_url.rstrip("/")
-        auth = (body.jira_email, body.jira_api_token)
+        from app.ml.jira_signals import JiraSignalError, _cloud_base_and_project_key
+        url, _ = _cloud_base_and_project_key(jira_project_url)
         resp = httpx.get(
             f"{url}/rest/api/3/myself",
-            auth=auth,
+            auth=(jira_email, jira_api_token),
             headers={"Accept": "application/json"},
             timeout=10,
         )
@@ -345,26 +481,28 @@ def test_jira_connection(
             data = resp.json()
             return {
                 "success":      True,
+                "message":      "Jira connection successful",
                 "display_name": data.get("displayName", ""),
                 "account_id":   data.get("accountId", ""),
             }
-        elif resp.status_code == 401:
+        if resp.status_code == 401:
             raise HTTPException(
                 status_code=400,
                 detail="Authentication failed. Check your email and API token.",
             )
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Jira returned status {resp.status_code}. Check your URL.",
-            )
-    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Jira returned status {resp.status_code}. Check your URL and permissions.",
+        )
+    except httpx.ConnectError as exc:
         raise HTTPException(
             status_code=400,
             detail="Cannot connect to Jira. Check the URL is correct and reachable.",
-        )
-    except httpx.TimeoutException:
+        ) from exc
+    except httpx.TimeoutException as exc:
         raise HTTPException(
             status_code=400,
             detail="Connection timed out. The Jira server may be slow or unreachable.",
-        )
+        ) from exc
+    except JiraSignalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

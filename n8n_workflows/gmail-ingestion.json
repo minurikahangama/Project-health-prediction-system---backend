@@ -1,0 +1,14 @@
+{
+  "name": "PHPS - Gmail ingestion (all configured projects)",
+  "nodes": [
+    {"parameters": {"rule": {"interval": [{"field": "hours", "hoursInterval": 4}]}}, "id": "schedule-gmail", "name": "Every 4 hours", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1, "position": [240, 300]},
+    {"parameters": {"url": "http://host.docker.internal:8000/pipeline/projects", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Secret", "value": "REPLACE_WITH_N8N_WEBHOOK_SECRET"}]}}, "id": "get-projects", "name": "Get PHPS projects", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [460, 300]},
+    {"parameters": {"fieldToSplitOut": "projects"}, "id": "split-projects", "name": "Split projects", "type": "n8n-nodes-base.splitOut", "typeVersion": 1, "position": [680, 300]},
+    {"parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"leftValue": "={{ $json.gmail_filter_email }}", "rightValue": "", "operator": {"type": "string", "operation": "isNotEmpty"}}, {"leftValue": "={{ $json.gmail_project_identifier }}", "rightValue": "", "operator": {"type": "string", "operation": "isNotEmpty"}}]}, "options": {}}, "id": "has-gmail-setup", "name": "Has Gmail configuration", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [900, 300]},
+    {"parameters": {"resource": "message", "operation": "getAll", "returnAll": true, "filters": {"q": "={from:{{ $json.gmail_filter_email }} to:{{ $json.gmail_filter_email }}} \"{{ $json.gmail_project_identifier }}\" newer_than:5h"}}, "id": "gmail-search", "name": "Read matching Gmail", "type": "n8n-nodes-base.gmail", "typeVersion": 2, "position": [1120, 220]},
+    {"parameters": {"method": "POST", "url": "http://host.docker.internal:8000/pipeline/ingest-gmail", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Secret", "value": "REPLACE_WITH_N8N_WEBHOOK_SECRET"}]}, "sendBody": true, "specifyBody": "json", "jsonBody": "={{ { project_id: $('Has Gmail configuration').item.json.project_id, messages: [{ id: $json.id, subject: $json.subject || '', body: $json.textPlain || $json.text || $json.snippet || '' }] } }}", "options": {}}, "id": "send-gmail", "name": "Send to PHPS", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1340, 220]}
+  ],
+  "connections": {"Every 4 hours": {"main": [[{"node": "Get PHPS projects", "type": "main", "index": 0}]]}, "Get PHPS projects": {"main": [[{"node": "Split projects", "type": "main", "index": 0}]]}, "Split projects": {"main": [[{"node": "Has Gmail configuration", "type": "main", "index": 0}]]}, "Has Gmail configuration": {"main": [[{"node": "Read matching Gmail", "type": "main", "index": 0}], []]}, "Read matching Gmail": {"main": [[{"node": "Send to PHPS", "type": "main", "index": 0}]]}},
+  "active": false,
+  "settings": {"executionOrder": "v1", "timezone": "Asia/Colombo"}
+}

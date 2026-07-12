@@ -18,7 +18,7 @@ GDPR compliance:
 """
 from sqlalchemy import (
     Column, Integer, Float, String, Boolean,
-    DateTime, ForeignKey, Text
+    DateTime, ForeignKey, Text, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from app.utils.database import Base
@@ -60,6 +60,9 @@ class User(Base):
     force_password_change  = Column(Boolean, default=False)
     # force_password_change=True on first login for new accounts created by admins
     last_login             = Column(DateTime, nullable=True)
+    address                = Column(Text, nullable=True)
+    phone                  = Column(String(50), nullable=True)
+    profile_image_url      = Column(String(500), nullable=True)
     created_at             = Column(DateTime, default=utcnow)
 
     # Relationships
@@ -96,6 +99,9 @@ class Project(Base):
     # Gmail integration — token AES-256 encrypted at rest
     encrypted_gmail_token = Column(Text, nullable=True)
     gmail_filter_email    = Column(String(255), nullable=True)
+    # Identifier which must appear in a message before it is attributed to this
+    # project (for example "PHPS-42" or an internal project reference).
+    gmail_project_identifier = Column(String(255), nullable=True)
 
     # Per-project RAG thresholds (FR-12)
     green_threshold       = Column(Float, default=70.0)
@@ -116,6 +122,10 @@ class Project(Base):
                                  cascade="all, delete-orphan")
     gdpr_logs     = relationship("GDPRDeletionLog",  back_populates="project",
                                  cascade="all, delete-orphan")
+    transcripts   = relationship("TranscriptUpload", back_populates="project",
+                                 cascade="all, delete-orphan")
+    processed_emails = relationship("ProcessedEmail", back_populates="project",
+                                    cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Project id={self.id} name={self.name!r}>"
@@ -210,3 +220,31 @@ class GDPRDeletionLog(Base):
     def __repr__(self):
         return (f"<GDPRDeletionLog id={self.id} event={self.event_type!r} "
                 f"project_id={self.project_id}>")
+
+
+class ProcessedEmail(Base):
+    """Gmail message IDs retained solely to make n8n polling idempotent."""
+    __tablename__ = "processed_emails"
+    __table_args__ = (UniqueConstraint("project_id", "gmail_message_id", name="uq_processed_email"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    gmail_message_id = Column(String(255), nullable=False)
+    processed_at = Column(DateTime, default=utcnow, index=True)
+
+    project = relationship("Project", back_populates="processed_emails")
+
+
+class TranscriptUpload(Base):
+    """Metadata for a transcript retained at the project's request."""
+    __tablename__ = "transcript_uploads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    uploaded_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    original_filename = Column(String(255), nullable=False)
+    storage_filename = Column(String(255), nullable=False, unique=True)
+    size_bytes = Column(Integer, nullable=False)
+    uploaded_at = Column(DateTime, default=utcnow, index=True)
+
+    project = relationship("Project", back_populates="transcripts")

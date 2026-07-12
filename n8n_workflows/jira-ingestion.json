@@ -1,0 +1,13 @@
+{
+  "name": "PHPS - Jira Cloud ingestion (all configured projects)",
+  "nodes": [
+    {"parameters": {"rule": {"interval": [{"field": "cronExpression", "expression": "0 0 9 * * 1"}]}}, "id": "schedule-jira", "name": "Monday 09:00", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1, "position": [240, 300]},
+    {"parameters": {"url": "http://host.docker.internal:8000/pipeline/projects", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Secret", "value": "REPLACE_WITH_N8N_WEBHOOK_SECRET"}]}}, "id": "get-projects-jira", "name": "Get PHPS projects", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [460, 300]},
+    {"parameters": {"fieldToSplitOut": "projects"}, "id": "split-jira-projects", "name": "Split projects", "type": "n8n-nodes-base.splitOut", "typeVersion": 1, "position": [680, 300]},
+    {"parameters": {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"leftValue": "={{ $json.jira_configured }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}]}, "options": {}}, "id": "has-jira", "name": "Has Jira configuration", "type": "n8n-nodes-base.if", "typeVersion": 2.2, "position": [900, 300]},
+    {"parameters": {"method": "POST", "url": "http://host.docker.internal:8000/pipeline/ingest-jira", "sendHeaders": true, "headerParameters": {"parameters": [{"name": "X-N8N-Secret", "value": "REPLACE_WITH_N8N_WEBHOOK_SECRET"}]}, "sendBody": true, "specifyBody": "json", "jsonBody": "={{ { project_id: $json.project_id } }}", "options": {}}, "id": "send-jira", "name": "Sync Jira to PHPS", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1120, 220]}
+  ],
+  "connections": {"Monday 09:00": {"main": [[{"node": "Get PHPS projects", "type": "main", "index": 0}]]}, "Get PHPS projects": {"main": [[{"node": "Split projects", "type": "main", "index": 0}]]}, "Split projects": {"main": [[{"node": "Has Jira configuration", "type": "main", "index": 0}]]}, "Has Jira configuration": {"main": [[{"node": "Sync Jira to PHPS", "type": "main", "index": 0}], []]}},
+  "active": false,
+  "settings": {"executionOrder": "v1", "timezone": "Asia/Colombo"}
+}

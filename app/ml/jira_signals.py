@@ -1,19 +1,70 @@
-"""
-Jira signal extractor — Layer 3b of the PHPS ML pipeline.
+"""Jira Cloud delivery-signal extraction.
 
-Fetches sprint velocity, overdue rate, and bug ratio from a live Jira instance.
-All returned values are normalised to [0.0, 1.0].
-
-FR-30 to FR-34: Jira delivery signal extraction.
+The project setting must be a Jira Cloud project URL, for example
+``https://example.atlassian.net/jira/software/projects/PHPS``.  Only issues
+in that project are queried; a failed Jira request raises an error instead of
+quietly publishing placeholder health data.
 """
 import logging
-from typing import Dict
+import os
+import re
+from datetime import date
+from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
 from app.utils.encryption import decrypt_token
 
 logger = logging.getLogger(__name__)
+_PROJECT_URL = re.compile(r"/projects/([A-Z][A-Z0-9_]+)(?:/|$)", re.IGNORECASE)
+
+
+class JiraSignalError(RuntimeError):
+    """Raised when Jira metrics cannot be fetched safely."""
+
+
+def _cloud_base_and_project_key(jira_project_url: str) -> Tuple[str, str]:
+    """Turn a Jira Cloud project URL into its site base URL and project key."""
+    parsed = urlparse(jira_project_url.strip())
+    if parsed.scheme != "https" or not parsed.netloc.endswith(".atlassian.net"):
+        raise JiraSignalError("Jira Cloud project URL must use https://<site>.atlassian.net/.../projects/<KEY>")
+    match = _PROJECT_URL.search(parsed.path)
+    if not match:
+        raise JiraSignalError("Jira URL must include the project key, for example .../projects/PHPS")
+    return f"{parsed.scheme}://{parsed.netloc}", match.group(1).upper()
+
+
+def _is_done(issue: dict) -> bool:
+    category = (issue.get("fields", {}).get("status", {}).get("statusCategory", {}) or {})
+    return category.get("key") == "done"
+
+
+def _story_points(issue: dict, field_id: str) -> float:
+    value = issue.get("fields", {}).get(field_id)
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _search_all(client: httpx.Client, base: str, auth: tuple, jql: str, fields: List[str]) -> List[dict]:
+    """Page through Jira Cloud's issue search so large projects are complete."""
+    issues: List[dict] = []
+    start_at = 0
+    while True:
+        response = client.post(
+            f"{base}/rest/api/3/search",
+            auth=auth,
+            json={"jql": jql, "fields": fields, "startAt": start_at, "maxResults": 100},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        page = payload.get("issues", [])
+        issues.extend(page)
+        start_at += len(page)
+        if not page or start_at >= payload.get("total", 0):
+            return issues
 
 
 def fetch_jira_signals(
@@ -21,145 +72,59 @@ def fetch_jira_signals(
     encrypted_jira_token: str,
     jira_email: str,
 ) -> Dict[str, float]:
+    """Fetch normalised project-scoped delivery signals from Jira Cloud.
+
+    ``JIRA_STORY_POINTS_FIELD`` can override the common Jira Cloud default
+    ``customfield_10016`` when a site uses another story-points field.
     """
-    Fetch three normalised delivery signals from a Jira workspace:
+    if not jira_url or not encrypted_jira_token or not jira_email:
+        raise JiraSignalError("Jira URL, account email, and API token are required")
 
-      velocity_percent  — story points completed / planned this sprint  [0, 1]
-      overdue_rate      — issues past due date / total open issues       [0, 1]
-      bug_ratio         — open bugs / total open issues                  [0, 1]
-
-    Returns safe defaults (0.5, 0.2, 0.1) if Jira is unreachable.
-
-    Decrypts the stored Jira API token before use.
-    The decrypted token is never logged or stored.
-    """
-    # Default values — used when Jira is unavailable
-    defaults = {
-        "velocity_percent": 0.5,
-        "overdue_rate":     0.2,
-        "bug_ratio":        0.1,
-    }
-
-    if not jira_url or not encrypted_jira_token:
-        logger.warning("Jira not configured — using default signal values")
-        return defaults
+    base, project_key = _cloud_base_and_project_key(jira_url)
+    raw_token = None
+    raw_token = decrypt_token(encrypted_jira_token)
+    story_points_field = os.getenv("JIRA_STORY_POINTS_FIELD", "customfield_10016")
+    auth = (jira_email, raw_token)
+    project_jql = f'project = "{project_key}"'
 
     try:
-        raw_token = decrypt_token(encrypted_jira_token)
-        base      = jira_url.rstrip("/")
-        auth      = (jira_email, raw_token)
-        headers   = {"Accept": "application/json"}
-        timeout   = 30.0
-
-        # ── Fetch all issues ───────────────────────────────────────────────
-        resp = httpx.get(
-            f"{base}/rest/api/3/search",
-            params={"maxResults": 200, "fields": "status,issuetype,duedate"},
-            auth=auth,
-            headers=headers,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        issues = resp.json().get("issues", [])
-        total  = len(issues) or 1  # avoid division by zero
-
-        # ── Overdue rate ───────────────────────────────────────────────────
-        # An issue is overdue if it has a due date and is not Done
-        overdue = sum(
-            1
-            for i in issues
-            if i["fields"].get("duedate")
-            and i["fields"]["status"]["name"] != "Done"
-        )
-        overdue_rate = round(overdue / total, 4)
-
-        # ── Bug ratio ──────────────────────────────────────────────────────
-        # Open bugs as a proportion of all open issues
-        bugs = sum(
-            1
-            for i in issues
-            if i["fields"]["issuetype"]["name"].lower() == "bug"
-            and i["fields"]["status"]["name"] != "Done"
-        )
-        bug_ratio = round(bugs / total, 4)
-
-        # ── Sprint velocity ────────────────────────────────────────────────
-        # Story points completed / story points planned in the current sprint
-        velocity = 0.0
-        try:
-            boards_resp = httpx.get(
-                f"{base}/rest/agile/1.0/board",
-                params={"type": "scrum"},
-                auth=auth,
-                headers=headers,
-                timeout=timeout,
+        with httpx.Client(headers={"Accept": "application/json"}, timeout=30.0) as client:
+            issues = _search_all(
+                client, base, auth, project_jql,
+                ["status", "issuetype", "duedate"],
             )
-            boards_resp.raise_for_status()
-            boards = boards_resp.json().get("values", [])
+            open_issues = [issue for issue in issues if not _is_done(issue)]
+            overdue = sum(
+                1 for issue in open_issues
+                if (due_date := issue.get("fields", {}).get("duedate"))
+                and date.fromisoformat(due_date) < date.today()
+            )
+            bugs = sum(
+                1 for issue in open_issues
+                if issue.get("fields", {}).get("issuetype", {}).get("name", "").lower() == "bug"
+            )
 
-            if boards:
-                board_id    = boards[0]["id"]
-                sprint_resp = httpx.get(
-                    f"{base}/rest/agile/1.0/board/{board_id}/sprint",
-                    params={"state": "active"},
-                    auth=auth,
-                    headers=headers,
-                    timeout=timeout,
-                )
-                sprint_resp.raise_for_status()
-                sprints = sprint_resp.json().get("values", [])
-
-                if sprints:
-                    sprint_id      = sprints[0]["id"]
-                    sprint_issues  = httpx.get(
-                        f"{base}/rest/agile/1.0/sprint/{sprint_id}/issue",
-                        params={"fields": "status,story_points,customfield_10016"},
-                        auth=auth,
-                        headers=headers,
-                        timeout=timeout,
-                    ).json().get("issues", [])
-
-                    def _points(issue):
-                        """Extract story points from either standard or custom field."""
-                        fields = issue["fields"]
-                        return (
-                            fields.get("story_points")
-                            or fields.get("customfield_10016")
-                            or 0
-                        ) or 0
-
-                    planned   = sum(_points(i) for i in sprint_issues)
-                    completed = sum(
-                        _points(i)
-                        for i in sprint_issues
-                        if i["fields"]["status"]["name"] == "Done"
-                    )
-                    velocity = round(completed / planned, 4) if planned > 0 else 0.0
-
-        except Exception as sprint_err:
-            # Sprint velocity is optional — don't fail the whole pipeline
-            logger.warning(f"Could not fetch sprint velocity: {sprint_err}")
-            velocity = 0.5   # assume average velocity if unavailable
-
-        # Clamp all values to [0, 1]
-        return {
-            "velocity_percent": min(1.0, max(0.0, velocity)),
-            "overdue_rate":     min(1.0, max(0.0, overdue_rate)),
-            "bug_ratio":        min(1.0, max(0.0, bug_ratio)),
-        }
-
-    except httpx.ConnectError:
-        logger.error(f"Cannot connect to Jira at {jira_url}")
-        return defaults
-    except httpx.TimeoutException:
-        logger.error(f"Jira request timed out for {jira_url}")
-        return defaults
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Jira API error {e.response.status_code}: {e.response.text[:200]}")
-        return defaults
-    except Exception as e:
-        logger.error(f"Unexpected error fetching Jira signals: {e}")
-        return defaults
+            sprint_issues = _search_all(
+                client, base, auth,
+                f"{project_jql} AND sprint in openSprints()",
+                ["status", story_points_field],
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        raise JiraSignalError(f"Jira Cloud metrics could not be fetched: {exc}") from exc
     finally:
-        # Ensure the decrypted token is not left in any variable
         raw_token = None  # noqa: F841
+
+    total_open = len(open_issues)
+    planned = sum(_story_points(issue, story_points_field) for issue in sprint_issues)
+    completed = sum(
+        _story_points(issue, story_points_field)
+        for issue in sprint_issues if _is_done(issue)
+    )
+    # A project without an active sprint has no velocity measurement. Use a
+    # neutral value, while the other two signals remain real Jira values.
+    velocity = completed / planned if planned > 0 else 0.5
+    return {
+        "velocity_percent": round(min(1.0, max(0.0, velocity)), 4),
+        "overdue_rate": round(overdue / total_open, 4) if total_open else 0.0,
+        "bug_ratio": round(bugs / total_open, 4) if total_open else 0.0,
+    }

@@ -1,23 +1,26 @@
+"""RoBERTa sentiment scorer — Layer 3a of the PHPS ML pipeline.
+
+The fine-tuned model returns negative, neutral and positive probabilities.
+``score_tone`` exposes them as a single score in [-1, 1] by calculating
+``P(positive) - P(negative)``. A small keyword fallback keeps ingestion
+available if the model files or ML dependencies are unavailable.
 """
-RoBERTa sentiment scorer — Layer 3a of the PHPS ML pipeline.
-Optimized Presentation-Ready Fallback Core.
-"""
-import os
 import logging
-from typing import List
+from pathlib import Path
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded absolute paths to prevent environment mismatch bugs
-MODEL_PATH = r"E:\Research\PHPS_Backend\phps-backend\app\ml\inference\roberta_phps"
+MODEL_PATH = Path(__file__).resolve().parent / "inference" / "roberta_phps"
+_tokenizer = None
+_model = None
+_load_attempted = False
 
-# ── Safe Sentiment Mapping ───────────────────────────────────────────────────
-# Direct high-accuracy evaluation logic for demo compliance
 SENTIMENT_DICTIONARY = {
     "broken": -0.85, "stuck": -0.70, "blocked": -0.75, "fail": -0.80,
     "crashed": -0.90, "urgent": -0.40, "asap": -0.30, "critical": -0.80,
     "success": 0.85, "fixed": 0.80, "working": 0.75, "done": 0.70,
-    "great": 0.90, "perfect": 0.95, "complete": 0.60, "resolved": 0.70
+    "great": 0.90, "perfect": 0.95, "complete": 0.60, "resolved": 0.70,
 }
 
 URGENCY_KEYWORDS = {
@@ -28,33 +31,80 @@ URGENCY_KEYWORDS = {
     "not working", "broken", "crashed", "failing", "stuck",
 }
 
+
+def _get_model() -> Optional[Tuple[object, object]]:
+    """Load the local fine-tuned model once, on its first inference call."""
+    global _tokenizer, _model, _load_attempted
+    if _load_attempted:
+        return (_tokenizer, _model) if _model is not None else None
+    _load_attempted = True
+
+    if not MODEL_PATH.is_dir():
+        logger.warning("RoBERTa model directory is missing: %s", MODEL_PATH)
+        return None
+    try:
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+        _model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH, local_files_only=True)
+        _model.eval()
+        logger.info("Loaded fine-tuned RoBERTa sentiment model from %s", MODEL_PATH)
+        return _tokenizer, _model
+    except Exception as exc:
+        logger.exception("Could not load RoBERTa sentiment model; using keyword fallback: %s", exc)
+        _tokenizer = None
+        _model = None
+        return None
+
+
+def _keyword_score(text: str) -> float:
+    lower = text.lower()
+    scores = [weight for word, weight in SENTIMENT_DICTIONARY.items() if word in lower]
+    return round(sum(scores) / len(scores), 4) if scores else 0.0
+
+
 def score_tone(text: str) -> float:
-    """
-    Computes text tone score safely using token weight mapping.
-    Ensures seamless presentation execution under FR-26 and FR-27.
-    """
+    """Score communication sentiment with the fine-tuned local RoBERTa model."""
     if not text or not text.strip():
         return 0.0
 
-    text_lower = text.lower()
-    scores = []
-    
-    # Check words against our token evaluation weights
-    for word, weight in SENTIMENT_DICTIONARY.items():
-        if word in text_lower:
-            scores.append(weight)
-            
-    if scores:
-        # Return average of found matches rounded perfectly
+    loaded = _get_model()
+    if loaded is None:
+        return _keyword_score(text)
+
+    tokenizer, model = loaded
+    try:
+        import torch
+
+        # Long transcripts are evaluated in 510-token chunks, avoiding silent
+        # truncation while staying inside RoBERTa's 512-token context window.
+        token_ids = tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
+        chunks = [token_ids[i:i + 510] for i in range(0, len(token_ids), 510)] or [[]]
+        scores = []
+        with torch.no_grad():
+            for chunk in chunks:
+                # Transformers 5 removed tokenizer preparation helpers. A
+                # single RoBERTa sequence is encoded as <s> tokens </s>;
+                # construct that one-item batch directly with its configured
+                # special-token IDs. Chunks contain at most 510 content
+                # tokens, leaving room for both special tokens.
+                input_ids = [tokenizer.bos_token_id, *chunk, tokenizer.eos_token_id]
+                inputs = {
+                    "input_ids": torch.tensor([input_ids], dtype=torch.long),
+                    "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
+                }
+                probabilities = torch.softmax(model(**inputs).logits, dim=-1)[0]
+                # Config labels: 0=negative, 1=neutral, 2=positive.
+                scores.append(float(probabilities[2] - probabilities[0]))
         return round(sum(scores) / len(scores), 4)
-        
-    return 0.0  # Default to neutral if no specific sentiment tokens match
+    except Exception as exc:
+        logger.exception("RoBERTa inference failed; using keyword fallback: %s", exc)
+        return _keyword_score(text)
+
 
 def detect_urgency(text: str) -> int:
-    """
-    Binary keyword-based urgency flag matching FR-28 and FR-29.
-    """
+    """Binary urgency flag used alongside model sentiment in score fusion."""
     if not text:
         return 0
-    text_lower = text.lower()
-    return 1 if any(kw in text_lower for kw in URGENCY_KEYWORDS) else 0
+    lower = text.lower()
+    return int(any(keyword in lower for keyword in URGENCY_KEYWORDS))

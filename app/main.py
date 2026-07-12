@@ -17,6 +17,7 @@ import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -25,7 +26,7 @@ from app.utils.database import engine, SessionLocal
 from app.models import models
 
 # Import all routers
-from app.api import auth, projects, pipeline, client, admin
+from app.api import auth, projects, pipeline, client, admin, profile
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,6 +49,7 @@ app = FastAPI(
     docs_url    = "/docs",
     redoc_url   = "/redoc",
 )
+scheduler_task: asyncio.Task | None = None
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -59,14 +61,26 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ── CORS ──────────────────────────────────────────────────────────────────────
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+# ── CORS Configuration (Updated to add port 8080) ─────────────────────────
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = [FRONTEND_URL, "http://localhost:3000", "http://localhost:5174"],
-    allow_credentials = True,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
+    allow_origins=[
+        FRONTEND_URL, 
+        "http://localhost:3000", 
+        "http://localhost:5174",
+        "http://localhost:8080",  # Added: Your active React port
+        "http://127.0.0.1:5173",  
+        "http://127.0.0.1:5174",  
+        "http://127.0.0.1:8080",  # Added: Loopback IP variation for port 8080
+        "http://127.0.0.1:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
+app.mount("/uploads", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "uploads")), name="uploads")
 
 # ── Startup: create all database tables ───────────────────────────────────────
 @app.on_event("startup")
@@ -74,8 +88,34 @@ async def startup_event():
     """Create all tables if they do not yet exist."""
     logger.info("Creating database tables if they do not exist...")
     models.Base.metadata.create_all(bind=engine)
+    # create_all does not add fields to an existing table; keep local PostgreSQL
+    # installations compatible when profile support is introduced.
+    from sqlalchemy import text
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT"))
+        connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50)"))
+        connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_image_url VARCHAR(500)"))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS gmail_project_identifier VARCHAR(255)"
+        ))
     logger.info("Database ready.")
+    global scheduler_task
+    from app.services.scheduler import run_scheduler, scheduler_enabled
+    if scheduler_enabled():
+        scheduler_task = asyncio.create_task(run_scheduler(), name="phps-ingestion-scheduler")
+        logger.info("Internal Gmail/Jira scheduler enabled (Asia/Colombo).")
     logger.info(f"API docs available at: http://localhost:8000/docs")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the in-process scheduler cleanly when the API exits."""
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 
 # ── Routers ───────────────────────────────────────────────────────────────────
@@ -84,6 +124,7 @@ app.include_router(projects.router, prefix="/projects", tags=["Projects"])
 app.include_router(pipeline.router, prefix="/pipeline", tags=["Pipeline"])
 app.include_router(client.router,   prefix="/client",   tags=["Client"])
 app.include_router(admin.router,    prefix="/admin",    tags=["Admin"])
+app.include_router(profile.router,  prefix="/profile",  tags=["Profile"])
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

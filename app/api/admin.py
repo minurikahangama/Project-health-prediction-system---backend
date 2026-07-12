@@ -23,6 +23,8 @@ from typing import Optional, List
 from passlib.context import CryptContext
 import io
 import csv
+import logging
+import os
 
 from app.utils.database import get_db
 from app.api.auth import get_current_user, require_role
@@ -30,9 +32,11 @@ from app.models.models import (
     Organisation, User, Project, HealthScore, ClientShareToken
 )
 from app.utils.time import utcnow
+from app.utils.email import EmailDeliveryError, send_account_credentials
 
 router   = APIRouter()
 pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
+logger   = logging.getLogger(__name__)
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -99,7 +103,80 @@ def create_organisation(
     db.add(org)
     db.commit()
     db.refresh(org)
-    return {"id": org.id, "name": org.name, "message": "Organisation created"}
+    return {
+        "id": org.id,
+        "name": org.name,
+        "industry": org.industry,
+        "total_projects": 0,
+        "avg_health": None,
+        "created_at": org.created_at.isoformat(),
+        "message": "Organisation created",
+    }
+
+
+def _get_organisation_or_404(org_id: int, db: Session) -> Organisation:
+    org = db.query(Organisation).filter(Organisation.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organisation not found")
+    return org
+
+
+@router.get("/organisations/{org_id}/users")
+def list_organisation_users(
+    org_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role("super_admin")),
+):
+    """List only the users who belong to one organisation."""
+    _get_organisation_or_404(org_id, db)
+    users = (
+        db.query(User)
+        .filter(User.org_id == org_id)
+        .order_by(User.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": u.id,
+            "full_name": u.name,
+            "email": u.email,
+            "role": u.role,
+            "org_id": u.org_id,
+            "is_active": u.is_active,
+            "force_password_change": u.force_password_change,
+            "created_at": u.created_at.isoformat(),
+            "last_login": u.last_login.isoformat() if u.last_login else None,
+        }
+        for u in users
+    ]
+
+
+@router.get("/organisations/{org_id}/health-scores")
+def list_organisation_health_scores(
+    org_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role("super_admin")),
+):
+    """List health-score records for projects in one organisation."""
+    _get_organisation_or_404(org_id, db)
+    scores = (
+        db.query(HealthScore, Project.name)
+        .join(Project, HealthScore.project_id == Project.id)
+        .filter(Project.org_id == org_id)
+        .order_by(HealthScore.recorded_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": score.id,
+            "project_id": score.project_id,
+            "project_name": project_name,
+            "health_score": score.health_score,
+            "rag_status": score.rag_status,
+            "recorded_at": score.recorded_at.isoformat(),
+        }
+        for score, project_name in scores
+    ]
 
 
 @router.get("/users")
@@ -120,11 +197,13 @@ def list_users(
     return [
         {
             "id":         u.id,
-            "name":       u.name,
+            "full_name":  u.name,
             "email":      u.email,
             "role":       u.role,
             "org_id":     u.org_id,
             "is_active":  u.is_active,
+            "force_password_change": u.force_password_change,
+            "created_at": u.created_at.isoformat(),
             "last_login": u.last_login.isoformat() if u.last_login else None,
         }
         for u in users
@@ -182,11 +261,39 @@ def create_user(
     db.commit()
     db.refresh(new_user)
 
+    email_sent = True
+    try:
+        send_account_credentials(
+            recipient=new_user.email,
+            full_name=new_user.name,
+            role=new_user.role,
+            temporary_password=data.temporary_password,
+        )
+    except EmailDeliveryError as exc:
+        logger.exception("Account email delivery failed for %s", new_user.email)
+        allow_without_email = os.getenv("ALLOW_ACCOUNT_CREATION_WITHOUT_EMAIL", "false").lower() in {"1", "true", "yes"}
+        if not allow_without_email:
+            db.delete(new_user)
+            db.commit()
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        email_sent = False
+        logger.warning("Created account for %s without sending credentials: %s", new_user.email, exc)
+
     return {
         "id":      new_user.id,
+        "full_name": new_user.name,
         "email":   new_user.email,
         "role":    new_user.role,
-        "message": f"Account created. Login credentials should be sent to {data.email}.",
+        "org_id":  new_user.org_id,
+        "is_active": new_user.is_active,
+        "force_password_change": new_user.force_password_change,
+        "created_at": new_user.created_at.isoformat(),
+        "email_sent": email_sent,
+        "message": (
+            f"Account created and login credentials emailed to {data.email}."
+            if email_sent else
+            f"Account created, but credentials were not emailed because SMTP is unavailable."
+        ),
     }
 
 
@@ -275,9 +382,13 @@ def get_share_link_audit(
         result.append({
             "id":            t.id,
             "project_id":    t.project_id,
+            "project_name":  t.project.name if t.project else f"Project #{t.project_id}",
+            "created_by_email": t.created_by.email if t.created_by else "System",
             "token_prefix":  t.token_hash[:8] + "...",  # show only first 8 chars
             "status":        computed_status,
             "expiry_date":   t.expiry_date.isoformat() if t.expiry_date else "Never",
+            "expires_at":    t.expiry_date.isoformat() if t.expiry_date else None,
+            "is_active":     computed_status == "active",
             "last_accessed": t.last_accessed.isoformat() if t.last_accessed else None,
             "created_at":    t.created_at.isoformat(),
         })
@@ -299,6 +410,7 @@ def get_system_health(
         db_status = f"error: {str(e)}"
 
     total_orgs     = db.query(func.count(Organisation.id)).scalar()
+    total_users    = db.query(func.count(User.id)).scalar()
     total_projects = db.query(func.count(Project.id)).scalar()
     total_scores   = db.query(func.count(HealthScore.id)).scalar()
 
@@ -310,10 +422,14 @@ def get_system_health(
 
     return {
         "database":         db_status,
+        "db_status":        "ok" if db_status == "connected" else db_status,
         "total_orgs":       total_orgs,
+        "total_users":      total_users,
         "total_projects":   total_projects,
         "total_scores":     total_scores,
+        "total_health_scores": total_scores,
         "last_ingestion":   latest_score.recorded_at.isoformat() if latest_score else None,
+        "last_ingestion_at": latest_score.recorded_at.isoformat() if latest_score else None,
         "checked_at":       utcnow().isoformat(),
     }
 
@@ -398,7 +514,8 @@ def org_admin_projects(
         result.append({
             "id":           p.id,
             "name":         p.name,
-            "pm_name":      pm.name if pm else "Unassigned",
+            "assigned_pm_id": p.created_by_user_id,
+            "assigned_pm_name": pm.name if pm else "Unassigned",
             "start_date":   p.start_date.isoformat(),
             "deadline":     p.deadline.isoformat(),
             "health_score": latest.health_score if latest else None,
@@ -427,9 +544,11 @@ def org_admin_team(
         ).scalar()
         result.append({
             "id":            pm.id,
-            "name":          pm.name,
+            "full_name":     pm.name,
             "email":         pm.email,
             "is_active":     pm.is_active,
+            "force_password_change": pm.force_password_change,
+            "created_at":    pm.created_at.isoformat(),
             "project_count": project_count,
             "last_login":    pm.last_login.isoformat() if pm.last_login else None,
         })

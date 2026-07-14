@@ -19,7 +19,12 @@ def run_gmail_poll() -> None:
     from app.api.pipeline import sync_gmail_project
     db = SessionLocal()
     try:
-        projects = db.query(Project).filter(Project.gmail_filter_email.isnot(None), Project.gmail_project_identifier.isnot(None)).all()
+        projects = db.query(Project).filter(
+            Project.gmail_account_email.isnot(None),
+            Project.encrypted_gmail_token.isnot(None),
+            Project.gmail_filter_email.isnot(None),
+            Project.gmail_project_identifier.isnot(None),
+        ).all()
         for project in projects:
             try:
                 result = sync_gmail_project(db, project)
@@ -53,19 +58,19 @@ def run_jira_poll() -> None:
 
 
 async def run_scheduler() -> None:
-    """Run Gmail at 00:00/04:00/... and Jira Monday 09:00 Colombo time."""
+    """Run Gmail and Jira every four hours in Asia/Colombo time."""
     last_gmail_slot: str | None = None
     last_jira_slot: str | None = None
     while True:
         now = datetime.now(LOCAL_TIMEZONE)
         gmail_slot = now.strftime("%Y-%m-%d-%H")
-        jira_slot = now.strftime("%Y-%m-%d")
+        jira_slot = now.strftime("%Y-%m-%d-%H")
         # Run once in each due hour. This also recovers a service that starts
         # shortly after the exact minute instead of silently missing a cycle.
         if now.hour % 4 == 0 and last_gmail_slot != gmail_slot:
             last_gmail_slot = gmail_slot
             await asyncio.to_thread(run_gmail_poll)
-        if now.weekday() == 0 and now.hour == 9 and last_jira_slot != jira_slot:
+        if now.hour % 4 == 0 and last_jira_slot != jira_slot:
             last_jira_slot = jira_slot
             await asyncio.to_thread(run_jira_poll)
         await asyncio.sleep(20)

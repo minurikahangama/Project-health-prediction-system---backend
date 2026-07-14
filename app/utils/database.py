@@ -17,12 +17,14 @@ if not DATABASE_URL:
         "Copy .env.example to .env and fill in your PostgreSQL credentials."
     )
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,       # reconnects if connection dropped
-    pool_size=10,
-    max_overflow=20,
-)
+engine_options = {"pool_pre_ping": True}
+# SQLite's SingletonThreadPool does not accept PostgreSQL queue-pool sizing
+# options. Keeping them conditional lets isolated integration tests use the
+# documented sqlite:///:memory: URL without changing production behaviour.
+if not DATABASE_URL.startswith("sqlite"):
+    engine_options.update(pool_size=10, max_overflow=20)
+
+engine = create_engine(DATABASE_URL, **engine_options)
 
 SessionLocal = sessionmaker(
     autocommit=False,

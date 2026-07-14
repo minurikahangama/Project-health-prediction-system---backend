@@ -25,13 +25,13 @@ try:
     import spacy
     nlp = spacy.load("en_core_web_trf")
     logger.info("Loaded spaCy model: en_core_web_trf")
-except OSError:
+except (ImportError, OSError):
     try:
         import spacy
         nlp = spacy.load("en_core_web_sm")
         logger.warning("en_core_web_trf not found — using en_core_web_sm. "
                        "Run: python -m spacy download en_core_web_trf")
-    except OSError:
+    except (ImportError, OSError):
         nlp = None
         logger.error("No spaCy model found. "
                      "Run: python -m spacy download en_core_web_sm")

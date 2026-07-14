@@ -23,6 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from app.utils.database import Base
 from app.utils.time import utcnow
+from sqlalchemy import UniqueConstraint
 
 
 class Organisation(Base):
@@ -98,10 +99,17 @@ class Project(Base):
 
     # Gmail integration — token AES-256 encrypted at rest
     encrypted_gmail_token = Column(Text, nullable=True)
+    gmail_account_email   = Column(String(255), nullable=True)
     gmail_filter_email    = Column(String(255), nullable=True)
     # Identifier which must appear in a message before it is attributed to this
     # project (for example "PHPS-42" or an internal project reference).
     gmail_project_identifier = Column(String(255), nullable=True)
+
+    # Sync audit metadata shown in project detail pages.
+    last_jira_synced_at  = Column(DateTime, nullable=True)
+    last_jira_synced_by  = Column(String(255), nullable=True)
+    last_email_synced_at = Column(DateTime, nullable=True)
+    last_email_synced_by = Column(String(255), nullable=True)
 
     # Per-project RAG thresholds (FR-12)
     green_threshold       = Column(Float, default=70.0)
@@ -153,6 +161,10 @@ class HealthScore(Base):
     overdue_rate     = Column(Float, nullable=False)     # Jira [0.0, 1.0]
     bug_ratio        = Column(Float, nullable=False)     # Jira [0.0, 1.0]
     divergence_flag  = Column(Integer, default=0)        # 0 or 1 — NOT Boolean
+    # Numeric provenance permits a deleted transcript's observation to be
+    # removed without retaining any of its raw text.
+    analysis_source  = Column(String(20), nullable=True) # gmail|jira|transcript
+    transcript_upload_id = Column(Integer, nullable=True, index=True)
 
     recorded_at      = Column(DateTime, default=utcnow, index=True)
 
@@ -223,17 +235,30 @@ class GDPRDeletionLog(Base):
 
 
 class ProcessedEmail(Base):
-    """Gmail message IDs retained solely to make n8n polling idempotent."""
+    """Email metadata and numeric-only analysis evidence; bodies are never retained."""
     __tablename__ = "processed_emails"
     __table_args__ = (UniqueConstraint("project_id", "gmail_message_id", name="uq_processed_email"),)
 
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     gmail_message_id = Column(String(255), nullable=False)
+    subject = Column(String(998), nullable=True)
+    sender = Column(String(255), nullable=True)
+    received_at = Column(DateTime, nullable=True)
+    # These numeric observations make a future project-level prediction
+    # reproducible without retaining the email body.
+    tone_score = Column(Float, nullable=True)
+    urgency_flag = Column(Integer, nullable=True)
     processed_at = Column(DateTime, default=utcnow, index=True)
 
     project = relationship("Project", back_populates="processed_emails")
-
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "gmail_message_id",
+            name="uq_project_gmail_message",
+        ),
+    )
 
 class TranscriptUpload(Base):
     """Metadata for a transcript retained at the project's request."""
@@ -245,6 +270,11 @@ class TranscriptUpload(Base):
     original_filename = Column(String(255), nullable=False)
     storage_filename = Column(String(255), nullable=False, unique=True)
     size_bytes = Column(Integer, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
+    # Persist only the derived values needed to recalculate after another
+    # transcript is added or this one is removed.
+    tone_score = Column(Float, nullable=True)
+    urgency_flag = Column(Integer, nullable=True)
     uploaded_at = Column(DateTime, default=utcnow, index=True)
 
     project = relationship("Project", back_populates="transcripts")

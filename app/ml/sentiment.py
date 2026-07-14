@@ -6,6 +6,7 @@ The fine-tuned model returns negative, neutral and positive probabilities.
 available if the model files or ML dependencies are unavailable.
 """
 import logging
+import re
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -19,8 +20,16 @@ _load_attempted = False
 SENTIMENT_DICTIONARY = {
     "broken": -0.85, "stuck": -0.70, "blocked": -0.75, "fail": -0.80,
     "crashed": -0.90, "urgent": -0.40, "asap": -0.30, "critical": -0.80,
+    "delay": -0.65, "delayed": -0.65, "behind": -0.60, "risk": -0.50,
+    "issue": -0.45, "problem": -0.55, "concern": -0.40, "unhappy": -0.70,
+    "frustrated": -0.75, "disappointed": -0.70, "overdue": -0.65,
+    "escalate": -0.70, "outage": -0.90, "regression": -0.75,
     "success": 0.85, "fixed": 0.80, "working": 0.75, "done": 0.70,
     "great": 0.90, "perfect": 0.95, "complete": 0.60, "resolved": 0.70,
+    "progress": 0.65, "improved": 0.70, "improvement": 0.70,
+    "ahead": 0.65, "smooth": 0.65, "stable": 0.55, "confident": 0.65,
+    "pleased": 0.75, "happy": 0.70, "positive": 0.60, "excellent": 0.90,
+    "productive": 0.65, "delivered": 0.70, "achieved": 0.70,
 }
 
 URGENCY_KEYWORDS = {
@@ -59,7 +68,13 @@ def _get_model() -> Optional[Tuple[object, object]]:
 
 def _keyword_score(text: str) -> float:
     lower = text.lower()
-    scores = [weight for word, weight in SENTIMENT_DICTIONARY.items() if word in lower]
+    # Word-boundary matching avoids treating unrelated substrings as evidence
+    # (for example, "issue" inside another word) while supporting ordinary
+    # project language when the optional RoBERTa package is unavailable.
+    scores = [
+        weight for word, weight in SENTIMENT_DICTIONARY.items()
+        if re.search(rf"\b{re.escape(word)}\b", lower)
+    ]
     return round(sum(scores) / len(scores), 4) if scores else 0.0
 
 
@@ -107,4 +122,20 @@ def detect_urgency(text: str) -> int:
     if not text:
         return 0
     lower = text.lower()
+    # A simple substring check made reassuring updates such as "no blockers"
+    # and "not at risk" trigger a health penalty.  Remove explicit negated
+    # risk statements before checking for genuine escalation language.
+    lower = re.sub(
+        r"\bno\s+(?:(?:blockers?|blocked|risks?|delays?|issues?|overdue)"
+        r"\s*(?:,|and|or)?\s*)+",
+        "",
+        lower,
+    )
+    lower = re.sub(
+        r"\b(?:no|not|without|zero)\s+(?:active\s+)?"
+        r"(?:urgent|urgency|blockers?|blocked|risks?|delays?|issues?|"
+        r"overdue|escalations?|outages?|emergencies)\b",
+        "",
+        lower,
+    )
     return int(any(keyword in lower for keyword in URGENCY_KEYWORDS))

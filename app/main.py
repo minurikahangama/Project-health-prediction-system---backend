@@ -24,6 +24,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.utils.database import engine, SessionLocal
 from app.models import models
+from app.services.project_health import ProjectHealthService
 
 # Import all routers
 from app.api import auth, projects, pipeline, client, admin, profile
@@ -97,6 +98,61 @@ async def startup_event():
         connection.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_image_url VARCHAR(500)"))
         connection.execute(text(
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS gmail_project_identifier VARCHAR(255)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS gmail_account_email VARCHAR(255)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_jira_synced_at TIMESTAMP"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_jira_synced_by VARCHAR(255)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_email_synced_at TIMESTAMP"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_email_synced_by VARCHAR(255)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS subject VARCHAR(998)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS sender VARCHAR(255)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS received_at TIMESTAMP"
+        ))
+        connection.execute(text(
+            "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS tone_score FLOAT"
+        ))
+        connection.execute(text(
+            "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS urgency_flag INTEGER"
+        ))
+        connection.execute(text(
+            "ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS tone_score FLOAT"
+        ))
+        connection.execute(text(
+            "ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS urgency_flag INTEGER"
+        ))
+        connection.execute(text(
+            "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS analysis_source VARCHAR(20)"
+        ))
+        connection.execute(text(
+            "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS transcript_upload_id INTEGER"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_health_scores_transcript_upload_id "
+            "ON health_scores (transcript_upload_id)"
+        ))
+        # A transcript upload is an analysis event.  Re-uploading the same
+        # notes must create a new event and rerun the health calculation, so
+        # older installations must not retain the content-deduplication index.
+        connection.execute(text(
+            "DROP INDEX IF EXISTS uq_project_transcript_content"
         ))
     logger.info("Database ready.")
     global scheduler_task
@@ -176,6 +232,7 @@ async def websocket_endpoint(ws: WebSocket, project_id: int):
                         "bug_ratio":       latest.bug_ratio,
                         "divergence_flag": latest.divergence_flag,
                         "recorded_at":     str(latest.recorded_at),
+                        "contributions": ProjectHealthService.explain_saved_score(latest),
                     })
             finally:
                 db.close()

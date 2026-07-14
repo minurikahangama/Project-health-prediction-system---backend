@@ -2,13 +2,14 @@
 Health score fusion — Layer 4 of the PHPS ML pipeline.
 
 compute_health_score() fuses 5 input signals into:
-  - health_score    [0, 100]     (XGBoost or rule-based fallback)
+  - health_score    [0, 100]     (calibrated, monotonic signal fusion)
   - divergence_flag {0, 1}       (FR-36: Jira healthy but sentiment declining)
   - rag_status      GREEN|AMBER|RED  (FR-37: per-project thresholds)
 
-Model loading:
-  - Looks for trained model at app/ml/inference/xgb_model.json
-  - Falls back to a weighted rule-based formula while the model is not yet trained
+The checked-in XGBoost artifact was trained on synthetic random data, so it is
+not evidence that a real project's health can be predicted accurately.  Live
+scoring therefore uses the documented weighted formula.  The artifact can be
+enabled only for controlled experiments with ``PHPS_USE_XGBOOST_MODEL=true``.
 """
 import os
 import logging
@@ -30,8 +31,10 @@ def _normalise_tone(tone_score: float) -> float:
     return max(0.0, min(1.0, (float(tone_score) + 1.0) / 2.0))
 
 def _get_model():
-    """Lazy-load XGBoost model on first call."""
+    """Load the experimental XGBoost model only when explicitly enabled."""
     global _model
+    if os.getenv("PHPS_USE_XGBOOST_MODEL", "").strip().lower() not in {"1", "true", "yes"}:
+        return None
     if _model is None:
         if os.path.isfile(MODEL_PATH):
             try:
@@ -76,7 +79,15 @@ def _rule_based_score(
 
     Urgency flag applies a 10-point penalty.
     """
-    tone_component     = ((tone + 1.0) / 2.0) * 30.0    # normalise [-1,1] → [0,1] → [0,30]
+    # Clamp all externally supplied values before calculation.  This makes
+    # the score stable even if a connector returns malformed percentages.
+    tone = max(-1.0, min(1.0, float(tone)))
+    velocity = max(0.0, min(1.0, float(velocity)))
+    overdue = max(0.0, min(1.0, float(overdue)))
+    bug_ratio = max(0.0, min(1.0, float(bug_ratio)))
+    urgency = 1 if urgency else 0
+
+    tone_component     = ((tone + 1.0) / 2.0) * 30.0
     velocity_component = velocity * 40.0
     overdue_component  = (1.0 - overdue) * 20.0
     bug_component      = (1.0 - bug_ratio) * 10.0
@@ -90,6 +101,56 @@ def _rule_based_score(
         - urgency_penalty
     )
     return max(0.0, min(100.0, raw))
+
+
+def explain_health_score(
+    *,
+    health_score: float,
+    tone_score: float,
+    urgency_flag: int,
+    velocity_percent: float,
+    overdue_rate: float,
+    bug_ratio: float,
+) -> Dict[str, float]:
+    """Return additive, read-only attributions for an already-made prediction.
+
+    This never participates in model inference.  It uses the documented PHPS
+    factor weights and normalises the positive components to the score already
+    returned by ``compute_health_score``.  Consequently the displayed values
+    always add up to that unchanged final score, including with XGBoost.
+    """
+    sentiment = _normalise_tone(tone_score) * 30.0
+    velocity = max(0.0, min(1.0, float(velocity_percent))) * 40.0
+    overdue = (1.0 - max(0.0, min(1.0, float(overdue_rate)))) * 20.0
+    bugs = (1.0 - max(0.0, min(1.0, float(bug_ratio)))) * 10.0
+    urgency = -10.0 if urgency_flag else 0.0
+    positive_total = sentiment + velocity + overdue + bugs
+
+    # Keep the urgency penalty visible, then scale only positive factors to
+    # reconcile their sum with the already-predicted score.
+    target_positive = max(0.0, float(health_score) - urgency)
+    scale = target_positive / positive_total if positive_total else 0.0
+    values = {
+        "communication_sentiment": sentiment * scale,
+        "velocity": velocity * scale,
+        "overdue_rate": overdue * scale,
+        "bug_ratio": bugs * scale,
+        "urgency_penalty": urgency,
+    }
+    values["delivery_metrics"] = values["velocity"] + values["overdue_rate"] + values["bug_ratio"]
+
+    # Round for the API while preserving the additive total exactly.
+    for key in values:
+        values[key] = round(values[key], 2)
+    values["delivery_metrics"] = round(
+        values["velocity"] + values["overdue_rate"] + values["bug_ratio"], 2
+    )
+    residual = round(float(health_score) - (
+        values["communication_sentiment"] + values["delivery_metrics"] + values["urgency_penalty"]
+    ), 2)
+    values["delivery_metrics"] = round(values["delivery_metrics"] + residual, 2)
+    values["velocity"] = round(values["velocity"] + residual, 2)
+    return values
 
 
 # ── Main function ─────────────────────────────────────────────────────────────
@@ -139,7 +200,10 @@ def compute_health_score(
         ]])
         score = round(float(model.predict(features)[0]), 2)
     else:
-        # Fallback to rule-based scoring
+        # Production path: each favourable communication/delivery change can
+        # only raise the score; each risk change can only lower it.  This is
+        # deliberately auditable until a model is validated against labelled
+        # historical project outcomes.
         score = round(
             _rule_based_score(
                 tone_score, urgency_flag,

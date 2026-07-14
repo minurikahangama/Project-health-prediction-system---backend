@@ -30,6 +30,25 @@ def make_synthetic_dataset(samples: int, seed: int):
     return features, np.clip(targets, 0, 100)
 
 
+def production_formula(features: np.ndarray) -> np.ndarray:
+    """Reproduce the live, interpretable health-score calculation.
+
+    Features use the XGBoost training convention: tone is already normalised
+    to [0, 1], followed by urgency, velocity, overdue rate and bug ratio.
+    """
+    tone, urgency, velocity, overdue, bugs = features.T
+    scores = (tone * 30) + (velocity * 40) + ((1 - overdue) * 20) + ((1 - bugs) * 10) - (urgency * 10)
+    return np.clip(scores, 0, 100)
+
+
+def metrics(actual: np.ndarray, predicted: np.ndarray) -> dict:
+    return {
+        "mae": round(float(mean_absolute_error(actual, predicted)), 4),
+        "rmse": round(float(mean_squared_error(actual, predicted) ** 0.5), 4),
+        "r2": round(float(r2_score(actual, predicted)), 4),
+    }
+
+
 def evaluate(samples: int, seed: int, test_size: float) -> dict:
     """Fit on a deterministic training split and return held-out metrics."""
     features, targets = make_synthetic_dataset(samples, seed)
@@ -45,17 +64,17 @@ def evaluate(samples: int, seed: int, test_size: float) -> dict:
         n_jobs=1,
     )
     model.fit(x_train, y_train)
-    predictions = model.predict(x_test)
+    xgb_predictions = model.predict(x_test)
+    formula_predictions = production_formula(x_test)
     return {
-        "dataset": "synthetic",
+        "dataset": "synthetic (not a real-world accuracy benchmark)",
         "samples": samples,
         "train_samples": len(x_train),
         "test_samples": len(x_test),
         "seed": seed,
         "test_size": test_size,
-        "mae": round(float(mean_absolute_error(y_test, predictions)), 4),
-        "rmse": round(float(mean_squared_error(y_test, predictions) ** 0.5), 4),
-        "r2": round(float(r2_score(y_test, predictions)), 4),
+        "xgboost": metrics(y_test, xgb_predictions),
+        "production_formula": metrics(y_test, formula_predictions),
     }
 
 

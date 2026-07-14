@@ -48,23 +48,47 @@ def _story_points(issue: dict, field_id: str) -> float:
         return 0.0
 
 
+def _work_units(issues: List[dict], field_id: str) -> tuple[float, bool]:
+    """Return story-point work, falling back to issue count when unestimated.
+
+    Jira does not require a story-point field.  Treating an unestimated sprint
+    as a neutral 50% velocity hid real delivery progress; issue count is the
+    only project data available in that case and keeps the ratio auditable.
+    """
+    points = [_story_points(issue, field_id) for issue in issues]
+    if any(points):
+        return sum(points), True
+    return float(len(issues)), False
+
+
 def _search_all(client: httpx.Client, base: str, auth: tuple, jql: str, fields: List[str]) -> List[dict]:
-    """Page through Jira Cloud's issue search so large projects are complete."""
+    """Page through Jira Cloud's current enhanced JQL search endpoint."""
     issues: List[dict] = []
-    start_at = 0
+    next_page_token = None
     while True:
+        body = {"jql": jql, "fields": fields, "maxResults": 100}
+        if next_page_token:
+            body["nextPageToken"] = next_page_token
         response = client.post(
-            f"{base}/rest/api/3/search",
+            f"{base}/rest/api/3/search/jql",
             auth=auth,
-            json={"jql": jql, "fields": fields, "startAt": start_at, "maxResults": 100},
+            json=body,
         )
         response.raise_for_status()
         payload = response.json()
         page = payload.get("issues", [])
         issues.extend(page)
-        start_at += len(page)
-        if not page or start_at >= payload.get("total", 0):
+        next_page_token = payload.get("nextPageToken")
+        if next_page_token:
+            continue
+        if payload.get("isLast") or not page:
             return issues
+        # The total check keeps the helper compatible with test doubles and
+        # older Jira responses while production uses nextPageToken above.
+        if "total" in payload and len(issues) >= payload["total"]:
+            return issues
+        # No continuation marker means this is the only page.
+        return issues
 
 
 def fetch_jira_signals(
@@ -115,16 +139,22 @@ def fetch_jira_signals(
         raw_token = None  # noqa: F841
 
     total_open = len(open_issues)
-    planned = sum(_story_points(issue, story_points_field) for issue in sprint_issues)
-    completed = sum(
-        _story_points(issue, story_points_field)
-        for issue in sprint_issues if _is_done(issue)
+    planned, uses_story_points = _work_units(sprint_issues, story_points_field)
+    completed, _ = _work_units(
+        [issue for issue in sprint_issues if _is_done(issue)], story_points_field
     )
-    # A project without an active sprint has no velocity measurement. Use a
-    # neutral value, while the other two signals remain real Jira values.
-    velocity = completed / planned if planned > 0 else 0.5
+    # This is the current sprint completion ratio: completed work divided by
+    # all work committed to the active sprint.  There is no velocity value to
+    # invent when Jira has no active sprint; the pipeline then retains its
+    # last measured value (or its neutral initial value).
+    velocity = completed / planned if planned > 0 else None
     return {
-        "velocity_percent": round(min(1.0, max(0.0, velocity)), 4),
+        "velocity_percent": round(min(1.0, max(0.0, velocity)), 4) if velocity is not None else None,
         "overdue_rate": round(overdue / total_open, 4) if total_open else 0.0,
         "bug_ratio": round(bugs / total_open, 4) if total_open else 0.0,
+        "active_sprint_issue_count": len(sprint_issues),
+        "active_sprint_uses_story_points": uses_story_points,
+        "open_issue_count": total_open,
+        "overdue_issue_count": overdue,
+        "open_bug_count": bugs,
     }

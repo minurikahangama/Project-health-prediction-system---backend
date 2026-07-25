@@ -24,10 +24,11 @@ from slowapi.errors import RateLimitExceeded
 
 from app.utils.database import engine, SessionLocal
 from app.models import models
-from app.services.project_health import ProjectHealthService
+from app.services.project_health import PredictionService
 
 # Import all routers
-from app.api import auth, projects, pipeline, client, admin, profile
+from app.api import auth, projects, pipeline, client, admin, profile, intelligence
+from app.routes import analytics
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -115,6 +116,16 @@ async def startup_event():
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_email_synced_by VARCHAR(255)"
         ))
         connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS jira_capacity_snapshot JSON"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS jira_capacity_synced_at TIMESTAMP"
+        ))
+        connection.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS jira_metrics_snapshot JSON"
+        ))
+        connection.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_state VARCHAR(32) DEFAULT 'INITIATION'"))
+        connection.execute(text(
             "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS subject VARCHAR(998)"
         ))
         connection.execute(text(
@@ -129,6 +140,9 @@ async def startup_event():
         connection.execute(text(
             "ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS urgency_flag INTEGER"
         ))
+        connection.execute(text("ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS penalty FLOAT"))
+        connection.execute(text("ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS recovery FLOAT"))
+        connection.execute(text("ALTER TABLE processed_emails ADD COLUMN IF NOT EXISTS decay_weight FLOAT"))
         connection.execute(text(
             "ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS content_sha256 VARCHAR(64)"
         ))
@@ -138,12 +152,26 @@ async def startup_event():
         connection.execute(text(
             "ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS urgency_flag INTEGER"
         ))
+        connection.execute(text("ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS penalty FLOAT"))
+        connection.execute(text("ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS recovery FLOAT"))
+        connection.execute(text("ALTER TABLE transcript_uploads ADD COLUMN IF NOT EXISTS decay_weight FLOAT"))
         connection.execute(text(
             "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS analysis_source VARCHAR(20)"
         ))
         connection.execute(text(
+            "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS prediction_source VARCHAR(64)"
+        ))
+        connection.execute(text(
             "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS transcript_upload_id INTEGER"
         ))
+        connection.execute(text(
+            "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS feature_vector JSON"
+        ))
+        connection.execute(text(
+            "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS shap_explanation JSON"
+        ))
+        connection.execute(text("ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS open_issues INTEGER DEFAULT 0"))
+        connection.execute(text("ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS open_bugs INTEGER DEFAULT 0"))
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_health_scores_transcript_upload_id "
             "ON health_scores (transcript_upload_id)"
@@ -177,10 +205,15 @@ async def shutdown_event():
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(auth.router,     prefix="/auth",     tags=["Authentication"])
 app.include_router(projects.router, prefix="/projects", tags=["Projects"])
+# Versioned dashboard contract. The unversioned router remains for existing
+# clients while new integrations can use /api/v1/projects/{id}/health.
+app.include_router(projects.router, prefix="/api/v1/projects", tags=["Projects v1"])
+app.include_router(intelligence.router, prefix="/api/v1/intelligence", tags=["Capacity Intelligence"])
 app.include_router(pipeline.router, prefix="/pipeline", tags=["Pipeline"])
 app.include_router(client.router,   prefix="/client",   tags=["Client"])
 app.include_router(admin.router,    prefix="/admin",    tags=["Admin"])
 app.include_router(profile.router,  prefix="/profile",  tags=["Profile"])
+app.include_router(analytics.router, prefix="/api", tags=["Analytics"])
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -232,7 +265,7 @@ async def websocket_endpoint(ws: WebSocket, project_id: int):
                         "bug_ratio":       latest.bug_ratio,
                         "divergence_flag": latest.divergence_flag,
                         "recorded_at":     str(latest.recorded_at),
-                        "contributions": ProjectHealthService.explain_saved_score(latest),
+                        "contributions": PredictionService.explain_saved_score(latest),
                     })
             finally:
                 db.close()

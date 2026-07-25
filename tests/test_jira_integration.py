@@ -148,7 +148,7 @@ class JiraIntegrationTests(unittest.TestCase):
         self.assertEqual(stored.overdue_rate, 0.25)
         self.assertEqual(stored.bug_ratio, 0.125)
 
-    def test_no_active_sprint_does_not_invent_velocity(self):
+    def test_no_active_sprint_reports_zero_velocity(self):
         issues = [
             {"fields": {"status": {"statusCategory": {"key": "new"}}, "duedate": None, "issuetype": {"name": "Task"}}},
         ]
@@ -159,7 +159,7 @@ class JiraIntegrationTests(unittest.TestCase):
                 "https://example.atlassian.net/jira/software/projects/PHPS", "encrypted", "pm@example.com"
             )
 
-        self.assertIsNone(metrics["velocity_percent"])
+        self.assertEqual(metrics["velocity_percent"], 0.0)
         self.assertEqual(metrics["active_sprint_issue_count"], 0)
         self.assertFalse(metrics["active_sprint_uses_story_points"])
 

@@ -1,0 +1,20 @@
+{
+  "rmse": 3.4298598189464573,
+  "mae": 2.7866133593241367,
+  "r2": 0.9565531911037589,
+  "features": [
+    "overall_sentiment",
+    "urgency_count",
+    "velocity",
+    "overdue_rate",
+    "bug_ratio",
+    "open_issues",
+    "open_bugs",
+    "email_count",
+    "transcript_count",
+    "days_to_deadline",
+    "sentiment_trend",
+    "velocity_trend",
+    "bug_trend"
+  ]
+}

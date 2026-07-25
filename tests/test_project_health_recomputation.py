@@ -1,6 +1,7 @@
 """Project-health recomputation must precede explanation and persistence."""
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -110,7 +111,9 @@ class ProjectHealthRecomputationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(compute.call_args.kwargs["tone_score"], (0.8 - 0.4 - 0.2) / 3)
         self.assertEqual(compute.call_args.kwargs["urgency_flag"], 1)
-        self.assertEqual(compute.call_args.kwargs["velocity_percent"], 0.5)
+        # A rebuild never borrows a prior health snapshot's delivery values.
+        # With no current Jira evidence, the feature is explicitly unknown/0.
+        self.assertEqual(compute.call_args.kwargs["velocity_percent"], 0.0)
 
     def test_positive_email_rebuilds_to_a_higher_health_score(self):
         emails = [SimpleNamespace(tone_score=0.1, urgency_flag=0)]
@@ -141,6 +144,33 @@ class ProjectHealthRecomputationTests(unittest.TestCase):
         self.assertEqual(urgent["urgency_flag"], 1)
         self.assertEqual(cleared["urgency_flag"], 0)
         self.assertGreater(cleared["health_score"], urgent["health_score"])
+
+    def test_ignores_communication_outside_the_default_30_day_window(self):
+        now = datetime.now(timezone.utc)
+        emails = [
+            SimpleNamespace(tone_score=.8, urgency_flag=0, processed_at=now),
+            SimpleNamespace(tone_score=-.9, urgency_flag=1, processed_at=now - timedelta(days=31)),
+        ]
+        db = _Session(self._latest(), emails, [])
+        service = project_health.ProjectHealthService(db)
+        communication = service.collect_project_communication_data(9)
+        self.assertEqual(len(communication.emails), 1)
+        self.assertEqual(service.calculate_average_tone(communication), .8)
+        self.assertEqual(service.calculate_project_urgency(communication), 0)
+
+    def test_non_jira_event_fetches_one_fresh_jira_snapshot_when_configured(self):
+        db = _Session(self._latest(), [SimpleNamespace(tone_score=.2, urgency_flag=0)], [])
+        project = SimpleNamespace(
+            id=9, green_threshold=70.0, red_threshold=40.0,
+            jira_url="https://example.atlassian.net/jira/software/projects/PHPS",
+            encrypted_jira_token="encrypted", jira_email="pm@example.com",
+        )
+        metrics = {"velocity_percent": .8, "overdue_rate": .1, "bug_ratio": .1,
+                   "open_issue_count": 10, "open_bug_count": 1}
+        with patch.object(project_health, "fetch_jira_signals", return_value=metrics) as fetch:
+            result = project_health.ProjectHealthService(db).recalculate(project)
+        fetch.assert_called_once_with(project.jira_url, project.encrypted_jira_token, project.jira_email)
+        self.assertEqual(result["jira_metrics"]["velocity_percent"], .8)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ GDPR compliance:
 """
 from sqlalchemy import (
     Column, Integer, Float, String, Boolean,
-    DateTime, ForeignKey, Text, UniqueConstraint
+    DateTime, ForeignKey, Text, UniqueConstraint, JSON
 )
 from sqlalchemy.orm import relationship
 from app.utils.database import Base
@@ -91,6 +91,7 @@ class Project(Base):
     start_date            = Column(DateTime, nullable=False)
     deadline              = Column(DateTime, nullable=False)
     team_size             = Column(Integer, nullable=False)
+    project_state         = Column(String(32), nullable=False, default="INITIATION")
 
     # Jira integration — tokens AES-256 encrypted at rest
     jira_url              = Column(String(500), nullable=True)
@@ -110,6 +111,13 @@ class Project(Base):
     last_jira_synced_by  = Column(String(255), nullable=True)
     last_email_synced_at = Column(DateTime, nullable=True)
     last_email_synced_by = Column(String(255), nullable=True)
+
+    # Replaced after every Jira sync; contains Jira work metadata only.
+    jira_capacity_snapshot = Column(JSON, nullable=True)
+    jira_capacity_synced_at = Column(DateTime, nullable=True)
+    # Replaced atomically after every Jira sync. This is evidence, not a
+    # health contribution or prediction cache.
+    jira_metrics_snapshot = Column(JSON, nullable=True)
 
     # Per-project RAG thresholds (FR-12)
     green_threshold       = Column(Float, default=70.0)
@@ -134,6 +142,10 @@ class Project(Base):
                                  cascade="all, delete-orphan")
     processed_emails = relationship("ProcessedEmail", back_populates="project",
                                     cascade="all, delete-orphan")
+    team_members = relationship("ProjectTeamMember", back_populates="project",
+                                cascade="all, delete-orphan")
+    jira_evidence_snapshots = relationship("JiraEvidenceSnapshot", back_populates="project",
+                                           cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Project id={self.id} name={self.name!r}>"
@@ -160,11 +172,18 @@ class HealthScore(Base):
     velocity_percent = Column(Float, nullable=False)     # Jira [0.0, 1.0]
     overdue_rate     = Column(Float, nullable=False)     # Jira [0.0, 1.0]
     bug_ratio        = Column(Float, nullable=False)     # Jira [0.0, 1.0]
+    open_issues      = Column(Integer, default=0)
+    open_bugs        = Column(Integer, default=0)
     divergence_flag  = Column(Integer, default=0)        # 0 or 1 — NOT Boolean
     # Numeric provenance permits a deleted transcript's observation to be
     # removed without retaining any of its raw text.
     analysis_source  = Column(String(20), nullable=True) # gmail|jira|transcript
+    prediction_source = Column(String(64), nullable=True) # model provenance
     transcript_upload_id = Column(Integer, nullable=True, index=True)
+    # Auditable snapshot of the fresh inputs and output explanations used for
+    # this prediction. Never used as the next prediction's health input.
+    feature_vector = Column(JSON, nullable=True)
+    shap_explanation = Column(JSON, nullable=True)
 
     recorded_at      = Column(DateTime, default=utcnow, index=True)
 
@@ -174,6 +193,41 @@ class HealthScore(Base):
     def __repr__(self):
         return (f"<HealthScore id={self.id} project_id={self.project_id} "
                 f"score={self.health_score} rag={self.rag_status!r}>")
+
+
+class ProjectTeamMember(Base):
+    """Latest Jira team-member and workload snapshot for one PHPS project."""
+    __tablename__ = "project_team_members"
+    __table_args__ = (UniqueConstraint("project_id", "jira_account_id", name="uq_project_jira_member"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    jira_account_id = Column(String(255), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=True)
+    avatar_url = Column(String(1000), nullable=True)
+    is_active_in_sprint = Column(Boolean, default=True, nullable=False)
+    current_story_points = Column(Float, default=0.0, nullable=False)
+    estimated_remaining_hours = Column(Float, default=0.0, nullable=False)
+    remaining_tasks = Column(Integer, default=0, nullable=False)
+    high_priority_tasks = Column(Integer, default=0, nullable=False)
+    blocked_tasks = Column(Integer, default=0, nullable=False)
+    workload_percentage = Column(Float, default=0.0, nullable=False)
+    last_synced_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+    project = relationship("Project", back_populates="team_members")
+
+
+class JiraEvidenceSnapshot(Base):
+    """Immutable Jira state used only to calculate delivery trends."""
+    __tablename__ = "jira_evidence_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    metrics = Column(JSON, nullable=False)
+    collected_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+    project = relationship("Project", back_populates="jira_evidence_snapshots")
 
 
 class ClientShareToken(Base):
@@ -249,6 +303,9 @@ class ProcessedEmail(Base):
     # reproducible without retaining the email body.
     tone_score = Column(Float, nullable=True)
     urgency_flag = Column(Integer, nullable=True)
+    penalty = Column(Float, nullable=True)
+    recovery = Column(Float, nullable=True)
+    decay_weight = Column(Float, nullable=True)
     processed_at = Column(DateTime, default=utcnow, index=True)
 
     project = relationship("Project", back_populates="processed_emails")
@@ -275,6 +332,9 @@ class TranscriptUpload(Base):
     # transcript is added or this one is removed.
     tone_score = Column(Float, nullable=True)
     urgency_flag = Column(Integer, nullable=True)
+    penalty = Column(Float, nullable=True)
+    recovery = Column(Float, nullable=True)
+    decay_weight = Column(Float, nullable=True)
     uploaded_at = Column(DateTime, default=utcnow, index=True)
 
     project = relationship("Project", back_populates="transcripts")

@@ -17,12 +17,20 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, validator
 from typing import Optional, List
 from datetime import datetime
+from types import SimpleNamespace
 
 from app.utils.database import get_db
 from app.utils.encryption import encrypt_token, decrypt_token
 from app.api.auth import get_current_user, require_role
-from app.models.models import Project, HealthScore, User, ProcessedEmail, TranscriptUpload
-from app.services.project_health import ProjectHealthService
+from app.models.models import Project, HealthScore, ProjectTeamMember, User, ProcessedEmail, TranscriptUpload
+from app.services.project_health import PredictionService
+from app.services.ai_insights import AIInsightsService
+from app.services.decision_support import DecisionSupportService
+from app.services.explainability import ExplainabilityService
+from app.services.team_capacity import TeamCapacityService
+from app.ml.jira_signals import fetch_jira_capacity_snapshot, JiraSignalError
+from app.services.feature_processor import prepare_advanced_features
+from app.services.health_policy import baseline_score
 
 import httpx
 
@@ -103,6 +111,49 @@ class GmailTestRequest(BaseModel):
     gmail_app_password: str
 
 
+class HealthSimulationRequest(BaseModel):
+    sprint_velocity: float
+    bug_ratio: float
+    overdue_rate: float
+    communication_sentiment: float
+    urgency_flag: int
+
+    @validator("sprint_velocity", "bug_ratio", "overdue_rate")
+    def percentage_in_range(cls, value):
+        if not 0 <= value <= 1:
+            raise ValueError("must be between 0 and 1")
+        return value
+
+    @validator("communication_sentiment")
+    def sentiment_in_range(cls, value):
+        if not -1 <= value <= 1:
+            raise ValueError("must be between -1 and 1")
+        return value
+
+    @validator("urgency_flag")
+    def urgency_is_binary(cls, value):
+        if value not in (0, 1):
+            raise ValueError("must be 0 or 1")
+        return value
+
+
+class CapacitySimulationRequest(BaseModel):
+    developer: str
+    unavailable_days: float
+
+    @validator("developer")
+    def developer_is_present(cls, value):
+        if not value.strip():
+            raise ValueError("developer is required")
+        return value.strip()
+
+    @validator("unavailable_days")
+    def unavailable_days_is_positive(cls, value):
+        if value < 0:
+            raise ValueError("unavailable_days must be zero or greater")
+        return value
+
+
 # ── Helper: check project belongs to current user's org ──────────────────────
 
 def _get_project_for_user(project_id: int, user: User, db: Session) -> Project:
@@ -141,8 +192,14 @@ def _project_response(project: Project, latest: Optional[HealthScore] = None) ->
         "pm_note": project.pm_note,
         "assigned_pm_id": project.created_by_user_id,
         "assigned_pm_name": project.pm.name if project.pm else None,
-        "health_score": latest.health_score if latest else None,
-        "rag_status": latest.rag_status if latest else None,
+        # 100 is the planned baseline, not an ML prediction.  It is never
+        # written to health_scores and therefore can never become model input.
+        "health_score": round(latest.health_score) if latest else 100,
+        "project_state": getattr(project, "project_state", "INITIATION") if not latest else "ACTIVE",
+        "raw_health_score": latest.health_score if latest else None,
+        "rag_status": latest.rag_status if latest else "PROJECT_INITIALIZED",
+        "project_status": "AI Prediction Available" if latest else "Project Initialized",
+        "is_baseline": latest is None,
         "divergence_flag": latest.divergence_flag if latest else 0,
         "velocity_percent": latest.velocity_percent if latest else None,
         "overdue_rate": latest.overdue_rate if latest else None,
@@ -157,27 +214,32 @@ def _project_response(project: Project, latest: Optional[HealthScore] = None) ->
     }
 
 
-def _create_initial_health_score(project: Project) -> HealthScore:
-    """Provide the required unmeasured state until the first data sync."""
-    return HealthScore(
-        project_id=project.id,
-        health_score=0.0,
-        rag_status="RED",
-        tone_score=0.0,
-        urgency_flag=0,
-        velocity_percent=0.0,
-        overdue_rate=0.0,
-        bug_ratio=0.0,
-        divergence_flag=0,
-    )
-
-
 def _rag_for_score(score: float, green_threshold: float, red_threshold: float) -> str:
     if score >= green_threshold:
         return "GREEN"
     if score < red_threshold:
         return "RED"
     return "AMBER"
+
+
+def _stable_display_scores(rows: list[HealthScore]) -> dict[int, int]:
+    """Convert raw XGBoost values to stable dashboard integers.
+
+    The raw values remain persisted unchanged. A new display value is adopted
+    only after the raw prediction has moved at least one full point from the
+    preceding prediction, preventing insignificant decimal fluctuations from
+    appearing as user-facing score changes.
+    """
+    displayed: dict[int, int] = {}
+    previous_raw: float | None = None
+    previous_display: int | None = None
+    for row in rows:
+        raw = float(row.health_score)
+        candidate = round(raw)
+        shown = candidate if previous_raw is None or abs(raw - previous_raw) >= 1.0 else previous_display
+        displayed[row.id] = int(shown if shown is not None else candidate)
+        previous_raw, previous_display = raw, displayed[row.id]
+    return displayed
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -264,8 +326,6 @@ def create_project(
     )
     db.add(project)
     db.flush()
-    # Zero is an explicit "not measured" state, never an estimate.
-    db.add(_create_initial_health_score(project))
     db.commit()
     db.refresh(project)
 
@@ -368,7 +428,16 @@ def update_project(
     if data.jira_api_token:
         project.encrypted_jira_token = encrypt_token(data.jira_api_token)
 
-    db.commit()
+    # Apply the setting changes before rebuilding so, in particular, a new
+    # deadline becomes part of the model's feature vector immediately.
+    if hasattr(db, "flush"):
+        db.flush()
+    if db.query(HealthScore).filter(HealthScore.project_id == project.id).first():
+        PredictionService(db).recalculate(project, analysis_source="project_settings")
+    else:
+        # Settings are still project evidence configuration, but a project
+        # without Jira evidence remains explicitly unmeasured.
+        db.commit()
     db.refresh(project)
     latest = (db.query(HealthScore).filter(HealthScore.project_id == project.id)
               .order_by(HealthScore.recorded_at.desc()).first())
@@ -415,11 +484,27 @@ def get_health_score(
         .first()
     )
     if not latest:
-        # Backfill older projects with the same unmeasured state.
-        latest = _create_initial_health_score(project)
-        db.add(latest)
-        db.commit()
-        db.refresh(latest)
+        return {
+            "status": "project_initialized",
+            "project_status": "Project Initialized",
+            "health_score": baseline_score(),
+            "raw_health_score": None,
+            "is_baseline": True,
+            "rag_status": "PROJECT_INITIALIZED",
+            "history": [],
+            "baseline": baseline_score(),
+            "delivery_deduction": 0.0,
+            "communication_deduction": 0.0,
+            "final_health_score": baseline_score(),
+            "breakdown": {
+                "sprint_velocity_penalty": 0.0,
+                "overdue_rate_penalty": 0.0,
+                "bug_ratio_penalty": 0.0,
+                "transcript_sentiment_penalty": 0.0,
+            },
+            "green_threshold": project.green_threshold,
+            "red_threshold": project.red_threshold,
+        }
 
     # History for charts — ascending order so charts render left → right
     sync_times = [
@@ -435,16 +520,20 @@ def get_health_score(
         .limit(20)
         .all()
     )
+    display_scores = _stable_display_scores(history_rows)
 
     def _contributions(row: HealthScore) -> dict:
-        return ProjectHealthService.explain_saved_score(row)
+        return PredictionService.explain_saved_score(row)
 
     history = [
         {
             "date":             row.recorded_at.strftime("%b %d"),
             "recorded_at":      row.recorded_at.isoformat(),
-            "score":            row.health_score,
-            "health_score":     row.health_score,
+            # Charts use the same exact deterministic value as the gauge;
+            # presentation rounding must never create a second score state.
+            "score":            round(row.health_score, 2),
+            "health_score":     round(row.health_score, 2),
+            "raw_health_score": row.health_score,
             "tone":             row.tone_score,
             "urgency_flag":     row.urgency_flag,
             "velocity_percent": row.velocity_percent,
@@ -466,6 +555,8 @@ def get_health_score(
     ).all()
     email_count = len(email_rows)
     transcript_count = len(transcript_rows)
+    has_communication_data = bool(email_count or transcript_count)
+    has_jira_data = project.last_jira_synced_at is not None
 
     # ``explain_health_score`` exposes urgency separately for diagnostics.
     # In the dashboard hierarchy it belongs to communication: urgency is
@@ -516,15 +607,17 @@ def get_health_score(
     # The dashboard uses the same contribution builder as event responses.
     # Explanations are read-only and are generated from the already-persisted
     # prediction; they never participate in score calculation.
-    health_service = ProjectHealthService(db)
+    health_service = PredictionService(db)
     dashboard_contributions = health_service.calculate_contributions(
         health_score=latest.health_score,
         tone_score=latest.tone_score,
         urgency_flag=latest.urgency_flag,
         jira_metrics={
+            **(getattr(project, "jira_metrics_snapshot", None) or {}),
             "velocity_percent": latest.velocity_percent,
             "overdue_rate": latest.overdue_rate,
             "bug_ratio": latest.bug_ratio,
+            "has_jira_data": has_jira_data,
         },
         communication=health_service.collect_project_communication_data(project_id),
     )
@@ -538,14 +631,37 @@ def get_health_score(
         "project_name":    project.name,
         "deadline":        project.deadline.isoformat(),
         # Latest score
-        "health_score":    latest.health_score,
+        "health_score":    round(latest.health_score, 2),
+        "raw_health_score": latest.health_score,
+        "baseline": 100.0,
+        "delivery_deduction": contribs["delivery_deduction"],
+        "communication_deduction": contribs["communication_deduction"],
+        "final_health_score": latest.health_score,
+        "breakdown": {
+            "sprint_velocity_penalty": contribs["sprint_velocity_penalty"],
+            "overdue_rate_penalty": contribs["overdue_rate_penalty"],
+            "bug_ratio_penalty": contribs["bug_ratio_penalty"],
+            "transcript_sentiment_penalty": contribs["transcript_sentiment_penalty"],
+            "divergence_warning_penalty": contribs["divergence_warning_penalty"],
+            "model_calibration_penalty": contribs["model_calibration_penalty"],
+        },
+        "is_baseline": False,
+        "project_status": "AI Prediction Available" if has_jira_data else "Initiation / Awaiting Data Sync",
         "rag_status":      latest.rag_status,
         "tone_score":      latest.tone_score,
         "urgency_flag":    latest.urgency_flag,
-        "velocity_percent": latest.velocity_percent,
-        "overdue_rate":    latest.overdue_rate,
-        "bug_ratio":       latest.bug_ratio,
+        "velocity_percent": latest.velocity_percent if has_jira_data else None,
+        "overdue_rate":    latest.overdue_rate if has_jira_data else None,
+        "bug_ratio":       latest.bug_ratio if has_jira_data else None,
         "divergence_flag": latest.divergence_flag,
+        "divergence_key": (getattr(latest, "feature_vector", None) or {}).get("divergence_key", "NONE_DETECTED"),
+        "divergence_label": (
+            "Delivery metrics are lagging behind positive communication sentiment."
+            if (getattr(latest, "feature_vector", None) or {}).get("divergence_key") == "DELIVERY_METRICS_LAGGING"
+            else "High delivery output, but communication sentiment has dropped."
+            if (getattr(latest, "feature_vector", None) or {}).get("divergence_key") == "COMMUNICATION_DEGRADED"
+            else "Signal alignment normal."
+        ),
         "contributions": contribs,
         "recorded_at":     latest.recorded_at.isoformat(),
         "last_updated_at":  last_synced_at or latest.recorded_at.isoformat(),
@@ -569,7 +685,194 @@ def get_health_score(
         "total_contribution":     total_contribution,
         "email_count":            email_count,
         "transcript_count":       transcript_count,
+        "sentiment_status": "READY" if has_communication_data else "NOT_SYNCED",
+        "delivery_status": "READY" if has_jira_data else "NOT_SYNCED",
     }
+
+
+@router.get("/{project_id}/health-summary")
+def get_health_summary(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Single source of truth for every Project Health dashboard widget.
+
+    Deduction points are positive magnitudes here, making the invariant
+    explicit: health_score == baseline_score - communication - delivery.
+    """
+    payload = get_health_score(project_id, db, current_user)
+    baseline = float(payload.get("baseline", baseline_score()))
+    delivery = abs(float(payload.get("delivery_deduction", 0.0)))
+    communication = abs(float(payload.get("communication_deduction", 0.0)))
+    payload.update({
+        "baseline_score": baseline,
+        "communication_deduction_pts": communication,
+        "delivery_deduction_pts": delivery,
+        "total_deduction_pts": round(communication + delivery, 2),
+        "health_score": round(max(0.0, baseline - communication - delivery), 2),
+        "shap_feature_deductions": [
+            {"key": key, "deduction_pts": abs(float(value))}
+            for key, value in payload.get("breakdown", {}).items()
+        ],
+    })
+    return payload
+
+
+@router.get("/{project_id}/health")
+def get_dashboard_health(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Dashboard contract for the top-down health engine, including kickoff."""
+    project = _get_project_for_user(project_id, current_user, db)
+    latest = db.query(HealthScore).filter(HealthScore.project_id == project_id).order_by(HealthScore.recorded_at.desc()).first()
+    snapshot = getattr(project, "jira_metrics_snapshot", None) or {}
+    has_jira_data = project.last_jira_synced_at is not None
+    has_communication_data = any(_evidence_counts(project_id, db))
+    if latest:
+        processed = prepare_advanced_features(
+            tone_score=latest.tone_score, urgency_keywords_count=latest.urgency_flag,
+            committed_story_pts=snapshot.get("committed_story_pts", 0), completed_story_pts=snapshot.get("completed_story_pts", 0),
+            is_sprint_active=snapshot.get("is_sprint_active", False), historical_3sprint_avg_velocity=snapshot.get("historical_3sprint_avg_velocity", .85),
+            total_open_issues=latest.open_issues, overdue_issues=snapshot.get("overdue_issue_count", latest.overdue_rate * latest.open_issues), open_bugs=latest.open_bugs,
+            has_jira_data=has_jira_data, has_communication_data=has_communication_data,
+        )
+        score, source = round(float(latest.health_score), 2), getattr(latest, "prediction_source", None) or "Deterministic Fallback Engine"
+        recorded = latest.recorded_at
+    else:
+        processed = prepare_advanced_features(snapshot, tone_score=None, is_brand_new=True, has_jira_data=False, has_communication_data=False)
+        score, source, recorded = 100.0, "Deterministic Fallback Engine", None
+    synced = max((item for item in (project.last_jira_synced_at, project.last_email_synced_at, recorded) if item is not None), default=None)
+    status = "Initiation / Awaiting Data Sync" if not has_jira_data else ("Healthy" if score >= project.green_threshold else "Critical" if score < project.red_threshold else "At Risk")
+    return {
+        "project_id": str(project_id), "project_name": project.name, "health_score": score,
+        "status": status, "prediction_source": source,
+        "last_synced_at": synced.isoformat().replace("+00:00", "Z") if synced else None,
+        "score_analysis": processed["score_analysis"], "flags": processed["flags"],
+        "raw_metrics_summary": processed["raw_metrics_summary"],
+    }
+
+
+def _latest_project_score(project_id: int, db: Session) -> HealthScore:
+    score = db.query(HealthScore).filter(HealthScore.project_id == project_id).order_by(HealthScore.recorded_at.desc()).first()
+    if not score:
+        raise HTTPException(status_code=404, detail="No health score is available yet. Sync Jira or Gmail data first.")
+    return score
+
+
+def _evidence_counts(project_id: int, db: Session) -> tuple[int, int]:
+    return (db.query(ProcessedEmail).filter(ProcessedEmail.project_id == project_id).count(), db.query(TranscriptUpload).filter(TranscriptUpload.project_id == project_id).count())
+
+
+@router.get("/{project_id}/ai-insights")
+def get_ai_insights(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = _get_project_for_user(project_id, current_user, db)
+    emails, transcripts = _evidence_counts(project_id, db)
+    return AIInsightsService.insights(project, _latest_project_score(project_id, db), emails, transcripts)
+
+@router.get("/{project_id}/explainability")
+def get_explainability(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = _get_project_for_user(project_id, current_user, db)
+    emails, transcripts = _evidence_counts(project_id, db)
+    latest = db.query(HealthScore).filter(HealthScore.project_id == project_id).order_by(HealthScore.recorded_at.desc()).first()
+    if latest is None:
+        # An unstarted project is explainable: its dashboard starts at the
+        # clean 100-point baseline rather than returning a cold-start 404.
+        baseline = prepare_advanced_features({"is_brand_new": True, "tone_score": None})
+        latest = SimpleNamespace(
+            health_score=100.0, tone_score=1.0, urgency_flag=0, velocity_percent=1.0,
+            overdue_rate=0.0, bug_ratio=0.0, open_issues=0, open_bugs=0,
+            feature_vector=baseline["features"], prediction_source="Deterministic Fallback Engine",
+            rag_status="GREEN", divergence_flag=0,
+        )
+    observations = db.query(HealthScore).filter(HealthScore.project_id == project_id).count()
+    return ExplainabilityService.build(project, latest, emails, transcripts, observations)
+
+
+@router.post("/{project_id}/health-simulation")
+def simulate_health(project_id: int, body: HealthSimulationRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = _get_project_for_user(project_id, current_user, db)
+    emails, transcripts = _evidence_counts(project_id, db)
+    return AIInsightsService.simulate(project, _latest_project_score(project_id, db), body.dict(), emails, transcripts)
+
+
+@router.get("/{project_id}/decision-support")
+def get_decision_support(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = _get_project_for_user(project_id, current_user, db); emails, transcripts = _evidence_counts(project_id, db)
+    return DecisionSupportService.build(project, _latest_project_score(project_id, db), email_count=emails, transcript_count=transcripts, capacity_analysis=_live_capacity_analysis(project))
+
+
+@router.post("/{project_id}/decision-support/simulate")
+def simulate_decision_support(project_id: int, body: HealthSimulationRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    project = _get_project_for_user(project_id, current_user, db); emails, transcripts = _evidence_counts(project_id, db)
+    return DecisionSupportService.build(project, _latest_project_score(project_id, db), body.dict(), email_count=emails, transcript_count=transcripts, capacity_analysis=_live_capacity_analysis(project))
+
+
+def _live_capacity_analysis(project: Project) -> dict:
+    if project.jira_capacity_snapshot:
+        return TeamCapacityService.analyse(project.jira_capacity_snapshot)
+    if not (project.jira_url and project.encrypted_jira_token and project.jira_email):
+        raise HTTPException(status_code=400, detail="Jira must be configured for team capacity analysis")
+    try:
+        snapshot = fetch_jira_capacity_snapshot(
+            project.jira_url, project.encrypted_jira_token, project.jira_email
+        )
+    except JiraSignalError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return TeamCapacityService.analyse(snapshot)
+
+
+@router.get("/{project_id}/capacity")
+def get_team_capacity(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return a new, read-only capacity/dependency analysis from live Jira."""
+    project = _get_project_for_user(project_id, current_user, db)
+    analysis = _live_capacity_analysis(project)
+    return {key: value for key, value in analysis.items() if not key.startswith("_")}
+
+
+@router.get("/{project_id}/team-members")
+def get_synced_team_members(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return the latest persisted team-member snapshot produced by Jira sync."""
+    _get_project_for_user(project_id, current_user, db)
+    members = db.query(ProjectTeamMember).filter(
+        ProjectTeamMember.project_id == project_id
+    ).order_by(ProjectTeamMember.is_active_in_sprint.desc(), ProjectTeamMember.display_name).all()
+    return [{
+        "jira_account_id": member.jira_account_id,
+        "display_name": member.display_name,
+        "email": member.email,
+        "avatar_url": member.avatar_url,
+        "is_active_in_sprint": member.is_active_in_sprint,
+        "current_story_points": member.current_story_points,
+        "estimated_remaining_hours": member.estimated_remaining_hours,
+        "remaining_tasks": member.remaining_tasks,
+        "high_priority_tasks": member.high_priority_tasks,
+        "blocked_tasks": member.blocked_tasks,
+        "workload_percentage": member.workload_percentage,
+        "last_synced_at": member.last_synced_at,
+    } for member in members]
+
+
+@router.post("/{project_id}/capacity/simulate")
+def simulate_capacity_unavailability(project_id: int, body: CapacitySimulationRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Model temporary absence against live Jira data without changing project state."""
+    project = _get_project_for_user(project_id, current_user, db)
+    analysis = _live_capacity_analysis(project)
+    try:
+        return TeamCapacityService.simulate_unavailability(
+            analysis, body.developer, body.unavailable_days,
+            project, _latest_project_score(project_id, db),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/{project_id}/forecast")
+def get_forecast(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return get_decision_support(project_id, db, current_user)
+
+
+@router.post("/{project_id}/forecast/simulate")
+def simulate_forecast(project_id: int, body: HealthSimulationRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return simulate_decision_support(project_id, body, db, current_user)
 
 
 @router.patch("/{project_id}/pm-note")

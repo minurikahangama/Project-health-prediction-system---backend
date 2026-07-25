@@ -6,6 +6,7 @@ The fine-tuned model returns negative, neutral and positive probabilities.
 available if the model files or ML dependencies are unavailable.
 """
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional, Tuple
@@ -78,6 +79,14 @@ def _keyword_score(text: str) -> float:
     return round(sum(scores) / len(scores), 4) if scores else 0.0
 
 
+def _calibrated_tone(logits) -> float:
+    """Temperature-calibrate raw model logits before the [-1, 1] mapping."""
+    import torch
+    temperature = max(0.05, float(os.getenv("PHPS_SENTIMENT_TEMPERATURE", "1.0")))
+    probabilities = torch.softmax(logits / temperature, dim=-1)[0]
+    return float(probabilities[2] - probabilities[0])
+
+
 def score_tone(text: str) -> float:
     """Score communication sentiment with the fine-tuned local RoBERTa model."""
     if not text or not text.strip():
@@ -91,10 +100,11 @@ def score_tone(text: str) -> float:
     try:
         import torch
 
-        # Long transcripts are evaluated in 510-token chunks, avoiding silent
-        # truncation while staying inside RoBERTa's 512-token context window.
+        # Overlapping windows preserve context at long-transcript boundaries.
         token_ids = tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
-        chunks = [token_ids[i:i + 510] for i in range(0, len(token_ids), 510)] or [[]]
+        window = min(510, max(1, int(getattr(tokenizer, "model_max_length", 512)) - 2))
+        stride = max(1, int(os.getenv("PHPS_SENTIMENT_WINDOW_STRIDE", str(window // 2))))
+        chunks = [token_ids[i:i + window] for i in range(0, len(token_ids), stride)] or [[]]
         scores = []
         with torch.no_grad():
             for chunk in chunks:
@@ -108,9 +118,7 @@ def score_tone(text: str) -> float:
                     "input_ids": torch.tensor([input_ids], dtype=torch.long),
                     "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
                 }
-                probabilities = torch.softmax(model(**inputs).logits, dim=-1)[0]
-                # Config labels: 0=negative, 1=neutral, 2=positive.
-                scores.append(float(probabilities[2] - probabilities[0]))
+                scores.append(_calibrated_tone(model(**inputs).logits))
         return round(sum(scores) / len(scores), 4)
     except Exception as exc:
         logger.exception("RoBERTa inference failed; using keyword fallback: %s", exc)

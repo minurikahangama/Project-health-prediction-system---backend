@@ -32,12 +32,13 @@ from pydantic import BaseModel
 from app.utils.database import get_db
 from app.utils.time import utcnow
 from app.api.auth import get_current_user, require_role
-from app.models.models import ProcessedEmail, Project, TranscriptUpload
+from app.models.models import JiraEvidenceSnapshot, ProcessedEmail, Project, ProjectTeamMember, TranscriptUpload
 from app.ml.preprocessor import process_and_delete
 from app.ml.sentiment import score_tone, detect_urgency
-from app.ml.jira_signals import JiraSignalError, fetch_jira_signals
+from app.ml.jira_signals import JiraSignalError, fetch_jira_capacity_snapshot, fetch_jira_signals
+from app.services.team_capacity import TeamCapacityService
 from app.services.gmail_ingestion import GmailIngestionError, fetch_messages
-from app.services.project_health import ProjectHealthService
+from app.services.project_health import PredictionService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ def _run_pipeline_and_save(
             "evidence must be saved before health is rebuilt.",
             project.id,
         )
-    result = ProjectHealthService(db).recalculate(
+    result = PredictionService(db).recalculate(
         project,
         jira_metrics=jira_signals,
         analysis_source=analysis_source,
@@ -178,6 +179,7 @@ def _run_pipeline_and_save(
         item for item in [*email_evidence, *transcript_evidence]
         if item.tone_score is not None and item.urgency_flag is not None
     ]
+    has_communication_data = bool(evidence)
     if evidence:
         tone = sum(item.tone_score for item in evidence) / len(evidence)
         urgency = int(any(item.urgency_flag for item in evidence))
@@ -187,13 +189,14 @@ def _run_pipeline_and_save(
         tone = score_tone(anonymised_text)
         urgency = detect_urgency(anonymised_text)
     else:
-        # Legacy projects without numeric evidence retain their last observed
-        # sentiment until new evidence is available.
-        tone = latest.tone_score if latest else 0.0
-        urgency = latest.urgency_flag if latest else 0
+        # No ingested communication is unknown, not a cached or positive
+        # sentiment observation.  Keep the raw database fields neutral while
+        # the scorer receives the explicit source-presence flag below.
+        tone, urgency = 0.0, 0
 
     # ── Layer 3b: Jira signals ─────────────────────────────────────────────
     if jira_signals:
+        has_jira_data = True
         velocity = jira_signals["velocity_percent"]
         overdue  = jira_signals["overdue_rate"]
         bug      = jira_signals["bug_ratio"]
@@ -203,10 +206,10 @@ def _run_pipeline_and_save(
         if velocity is None:
             velocity = latest.velocity_percent if latest else 0.5
     else:
-        # Use latest cached Jira signals from the database
-        velocity = latest.velocity_percent if latest else 0.5
-        overdue  = latest.overdue_rate     if latest else 0.2
-        bug      = latest.bug_ratio        if latest else 0.1
+        # Cold-start projects have no delivery observation. Never promote
+        # placeholder 100%/50% values into a persisted health prediction.
+        has_jira_data = False
+        velocity = overdue = bug = 0.0
 
     # ── Layer 4: XGBoost fusion ────────────────────────────────────────────
     result = compute_health_score(
@@ -217,6 +220,8 @@ def _run_pipeline_and_save(
         bug_ratio        = bug,
         green_threshold  = project.green_threshold,
         red_threshold    = project.red_threshold,
+        has_communication_data=has_communication_data,
+        has_jira_data=has_jira_data,
     )
 
     # ── Layer 5: Persist — numbers only, never text ────────────────────────
@@ -481,6 +486,13 @@ def sync_jira_project(db: Session, project: Project, actor=None) -> dict:
         logger.warning("Jira ingestion failed for project %s: %s", project.id, exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    # Replace the entire current-state snapshot before prediction. It is the
+    # delivery evidence used by subsequent non-Jira evidence events.
+    project.jira_metrics_snapshot = dict(signals)
+    db.add(JiraEvidenceSnapshot(project_id=project.id, metrics=dict(signals)))
+    if hasattr(db, "flush"):
+        db.flush()
+
     result = _run_pipeline_and_save(
         db              = db,
         project         = project,
@@ -488,6 +500,31 @@ def sync_jira_project(db: Session, project: Project, actor=None) -> dict:
         jira_signals    = signals,
         analysis_source = "jira",
     )
+    # Keep the persisted team directory and workload snapshot in sync with
+    # every manual or scheduled Jira health sync. Capacity remains available
+    # live too, but this makes the most recently synced members visible even
+    # outside an active dashboard request.
+    try:
+        capacity_snapshot = fetch_jira_capacity_snapshot(
+            jira_url=project.jira_url,
+            encrypted_jira_token=project.encrypted_jira_token,
+            jira_email=project.jira_email or "",
+        )
+        validation = TeamCapacityService.validate_snapshot(capacity_snapshot)
+        if not validation["valid"]:
+            reason = "; ".join(validation["errors"])
+            logger.error("Jira dashboard validation failed for project %s: %s", project.id, reason)
+            raise JiraSignalError(reason)
+        capacity_analysis = TeamCapacityService.analyse(capacity_snapshot)
+        _upsert_project_team_members(db, project.id, capacity_analysis["team_capacity"])
+        project.jira_capacity_snapshot = capacity_snapshot
+        project.jira_capacity_synced_at = utcnow()
+        result["team_members_synced"] = len(capacity_analysis["team_capacity"])
+        result["dashboard_validation"] = validation
+    except JiraSignalError as exc:
+        # Do not discard a valid health sync just because the optional Jira
+        # capacity metadata could not be retrieved on this request.
+        logger.warning("Team-member sync failed for project %s: %s", project.id, exc)
     # The manual-sync endpoint returns these source counts so the detailed
     # page can show exactly what Jira records produced the saved metrics.
     result["jira_metrics"].update({
@@ -495,6 +532,9 @@ def sync_jira_project(db: Session, project: Project, actor=None) -> dict:
         for key in (
             "active_sprint_issue_count", "active_sprint_uses_story_points",
             "open_issue_count", "overdue_issue_count", "open_bug_count",
+            "sprint_completion", "original_estimate_seconds",
+            "remaining_estimate_seconds", "remaining_estimate_ratio",
+            "blocked_issue_count", "dependency_risk", "team_workload_risk",
         )
     })
     result["jira_metrics"]["velocity_measured"] = signals["velocity_percent"] is not None
@@ -503,6 +543,34 @@ def sync_jira_project(db: Session, project: Project, actor=None) -> dict:
     result["last_jira_synced_at"] = project.last_jira_synced_at.isoformat()
     result["last_jira_synced_by"] = project.last_jira_synced_by
     return result
+
+
+def _upsert_project_team_members(db: Session, project_id: int, members: list[dict]) -> None:
+    """Replace the active Jira workload snapshot while retaining member history."""
+    now = utcnow()
+    existing = {
+        row.jira_account_id: row
+        for row in db.query(ProjectTeamMember).filter(ProjectTeamMember.project_id == project_id).all()
+    }
+    for row in existing.values():
+        row.is_active_in_sprint = False
+    for member in members:
+        account_id = str(member.get("jira_account_id") or member["developer"])
+        row = existing.get(account_id)
+        if not row:
+            row = ProjectTeamMember(project_id=project_id, jira_account_id=account_id, display_name=member["developer"])
+            db.add(row)
+        row.display_name = member["developer"]
+        row.email = member.get("email")
+        row.avatar_url = member.get("avatar_url")
+        row.is_active_in_sprint = True
+        row.current_story_points = member["current_story_points"]
+        row.estimated_remaining_hours = member["estimated_remaining_hours"]
+        row.remaining_tasks = member["remaining_tasks"]
+        row.high_priority_tasks = member["high_priority_tasks"]
+        row.blocked_tasks = member["blocked_tasks"]
+        row.workload_percentage = member["workload_percentage"]
+        row.last_synced_at = now
 
 
 @router.post("/upload-transcript")
@@ -609,22 +677,37 @@ def list_transcripts(project_id: int, db: Session = Depends(get_db), user=Depend
 
 @router.delete("/projects/{project_id}/transcripts/{transcript_id}")
 def delete_transcript(project_id: int, transcript_id: int, db: Session = Depends(get_db), user=Depends(require_role("pm", "org_admin"))):
+    _project_for_user(project_id, user, db)
+    from app.services.transcript_service import delete_transcript as delete_transcript_evidence
+    try:
+        return delete_transcript_evidence(str(transcript_id), db, project_id=project_id, storage_dir=TRANSCRIPT_DIR)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/projects/{project_id}/emails")
+def list_processed_emails(project_id: int, db: Session = Depends(get_db), user=Depends(require_role("pm", "org_admin"))):
+    """List retained email metadata; message bodies are never returned."""
+    _project_for_user(project_id, user, db)
+    rows = db.query(ProcessedEmail).filter_by(project_id=project_id).order_by(ProcessedEmail.processed_at.desc()).all()
+    return [{"id": row.id, "subject": row.subject, "sender": row.sender,
+             "received_at": row.received_at.isoformat() if row.received_at else None,
+             "processed_at": row.processed_at.isoformat()} for row in rows]
+
+
+@router.delete("/projects/{project_id}/emails/{email_id}")
+def delete_processed_email(project_id: int, email_id: int, db: Session = Depends(get_db), user=Depends(require_role("pm", "org_admin"))):
+    """Delete one email observation, then rebuild from all remaining evidence."""
     project = _project_for_user(project_id, user, db)
-    row = db.query(TranscriptUpload).filter_by(id=transcript_id, project_id=project_id).first()
+    row = db.query(ProcessedEmail).filter_by(id=email_id, project_id=project_id).first()
     if not row:
-        raise HTTPException(status_code=404, detail="Transcript not found")
-    path = TRANSCRIPT_DIR / row.storage_filename
-    if path.is_file():
-        path.unlink()
+        raise HTTPException(status_code=404, detail="Email not found")
     db.delete(row)
     if hasattr(db, "flush"):
         db.flush()
-    # Preserve historical predictions and append a new one based on the
-    # remaining emails/transcripts and latest Jira signals.
     result = _run_pipeline_and_save(
-        db=db, project=project, anonymised_text=None,
-        jira_signals=None,
-        analysis_source="transcript_deleted",
+        db=db, project=project, anonymised_text=None, jira_signals=None,
+        analysis_source="email_deleted",
     )
-    result["message"] = "Transcript removed and health score recalculated"
+    result["message"] = "Email removed and health score recalculated"
     return result

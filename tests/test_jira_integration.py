@@ -119,16 +119,14 @@ class JiraIntegrationTests(unittest.TestCase):
                 "https://example.atlassian.net/jira/software/projects/PHPS", "encrypted", "pm@example.com"
             )
 
-        self.assertEqual(metrics, {
-            "velocity_percent": 0.6,
-            "overdue_rate": 0.5,
-            "bug_ratio": 0.5,
-            "active_sprint_issue_count": 2,
-            "active_sprint_uses_story_points": True,
-            "open_issue_count": 2,
-            "overdue_issue_count": 1,
-            "open_bug_count": 1,
-        })
+        self.assertEqual(metrics["velocity_percent"], 0.6)
+        self.assertEqual(metrics["committed_story_pts"], 5)
+        self.assertEqual(metrics["completed_story_pts"], 3)
+        self.assertEqual(metrics["remaining_story_pts"], 2)
+        # Delivery-risk ratios use active-sprint issues only; the overdue bug
+        # in the project-wide fixture is not part of this sprint.
+        self.assertEqual(metrics["overdue_rate"], 0.0)
+        self.assertEqual(metrics["bug_ratio"], 0.0)
         self.assertTrue(all(url.endswith("/rest/api/3/search/jql") for _, url, _ in client.requests))
         self.assertTrue(all("startAt" not in body for _, _, body in client.requests))
 
@@ -148,7 +146,7 @@ class JiraIntegrationTests(unittest.TestCase):
         self.assertEqual(stored.overdue_rate, 0.25)
         self.assertEqual(stored.bug_ratio, 0.125)
 
-    def test_no_active_sprint_reports_zero_velocity(self):
+    def test_no_active_sprint_reports_null_velocity(self):
         issues = [
             {"fields": {"status": {"statusCategory": {"key": "new"}}, "duedate": None, "issuetype": {"name": "Task"}}},
         ]
@@ -159,7 +157,7 @@ class JiraIntegrationTests(unittest.TestCase):
                 "https://example.atlassian.net/jira/software/projects/PHPS", "encrypted", "pm@example.com"
             )
 
-        self.assertEqual(metrics["velocity_percent"], 0.0)
+        self.assertIsNone(metrics["velocity_percent"])
         self.assertEqual(metrics["active_sprint_issue_count"], 0)
         self.assertFalse(metrics["active_sprint_uses_story_points"])
 

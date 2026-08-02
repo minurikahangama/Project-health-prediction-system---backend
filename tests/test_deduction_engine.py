@@ -26,6 +26,17 @@ class DeductionEngineTests(unittest.TestCase):
         deductions = delivery_deductions(metrics)
         self.assertEqual(deductions["overdue"], 20)
         self.assertEqual(deductions["bug"], 25)
+        self.assertEqual(deductions["total"], 45)
+        metrics.update(is_sprint_active=True, committed_story_pts=10,
+                       actual_completed_story_pts=0, expected_velocity_ratio=.5)
+        self.assertEqual(delivery_deductions(metrics)["total"], 50)
+
+    def test_velocity_has_early_sprint_and_tolerance_windows(self):
+        metrics = {"is_sprint_active": True, "committed_story_pts": 10,
+                   "actual_completed_story_pts": 0, "expected_velocity_ratio": .10}
+        self.assertEqual(delivery_deductions(metrics)["velocity"], 0)
+        metrics.update(expected_velocity_ratio=.50, actual_completed_story_pts=4.5)
+        self.assertEqual(delivery_deductions(metrics)["velocity"], 0)
 
     def test_communication_recovery_only_offsets_communication(self):
         now = datetime.now(timezone.utc)

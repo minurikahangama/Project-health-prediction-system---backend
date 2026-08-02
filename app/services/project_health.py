@@ -282,7 +282,6 @@ class PredictionService:
         jira_metrics: Optional[dict] = None,
         analysis_source: Optional[str] = None,
         transcript_upload_id: Optional[int] = None,
-        neutral_when_no_transcripts: bool = False,
     ) -> dict:
         """Persist a newly calculated score from complete current project data."""
         logger.info("Prediction Started project=%s", project.id)
@@ -300,7 +299,10 @@ class PredictionService:
             )
         communication = self.collect_project_communication_data(project.id)
         logger.info("Communications Analysed project=%s emails=%s transcripts=%s", project.id, len(communication.emails), len(communication.transcripts))
-        tone_score = 0.0 if neutral_when_no_transcripts and not communication.transcripts else self.calculate_average_tone(communication)
+        # The remaining communications are always the evidence.  In
+        # particular, deleting the last transcript must not erase the impact
+        # of still-retained emails.
+        tone_score = self.calculate_average_tone(communication)
         urgency_flag = self.calculate_project_urgency(communication)
         logger.info("RoBERTa Complete project=%s weighted_sentiment=%.4f urgency=%s", project.id, tone_score, urgency_flag)
         metrics = self.fetch_jira_metrics(project.id, jira_metrics)
@@ -359,7 +361,14 @@ class PredictionService:
             analysis_source=analysis_source,
             transcript_upload_id=transcript_upload_id,
             feature_vector=prediction.get("feature_vector"),
-            shap_explanation=prediction.get("shap_values"),
+            # Persist the complete TreeSHAP payload (expected value and
+            # waterfall), not a display-only aggregate, so historic views
+            # remain auditable after the live model has changed.
+            shap_explanation=prediction.get("shap_explanation") or prediction.get("shap_values"),
+            deduction_snapshot={
+                "delivery": delivery_deductions(metrics),
+                "communication": communication_deduction(communication.observations),
+            },
         )
         self.db.add(score)
         self.db.commit()

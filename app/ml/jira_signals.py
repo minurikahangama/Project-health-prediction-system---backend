@@ -48,17 +48,9 @@ def _story_points(issue: dict, field_id: str) -> float:
         return 0.0
 
 
-def _work_units(issues: List[dict], field_id: str) -> tuple[float, bool]:
-    """Return story-point work, falling back to issue count when unestimated.
-
-    Jira does not require a story-point field.  Treating an unestimated sprint
-    as a neutral 50% velocity hid real delivery progress; issue count is the
-    only project data available in that case and keeps the ratio auditable.
-    """
-    points = [_story_points(issue, field_id) for issue in issues]
-    if any(points):
-        return sum(points), True
-    return float(len(issues)), False
+def _story_point_total(issues: List[dict], field_id: str) -> float:
+    """Return only Jira story points; velocity is never issue-count based."""
+    return sum(_story_points(issue, field_id) for issue in issues)
 
 
 def _sprint_window(issues: List[dict], sprint_field: str) -> tuple[datetime | None, datetime | None]:
@@ -74,6 +66,16 @@ def _sprint_window(issues: List[dict], sprint_field: str) -> tuple[datetime | No
             except (KeyError, TypeError, ValueError):
                 continue
     return None, None
+
+
+def _active_sprint(issues: List[dict], sprint_field: str) -> dict | None:
+    """Return the active-sprint metadata carried by the live Jira issues."""
+    for issue in issues:
+        raw = issue.get("fields", {}).get(sprint_field) or issue.get("fields", {}).get("sprint")
+        for sprint in raw if isinstance(raw, list) else [raw]:
+            if isinstance(sprint, dict) and str(sprint.get("state", "ACTIVE")).upper() == "ACTIVE":
+                return sprint
+    return None
 
 
 def _search_all(client: httpx.Client, base: str, auth: tuple, jql: str, fields: List[str]) -> List[dict]:
@@ -110,7 +112,7 @@ def fetch_jira_signals(
     jira_url: str,
     encrypted_jira_token: str,
     jira_email: str,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     """Fetch normalised project-scoped delivery signals from Jira Cloud.
 
     ``JIRA_STORY_POINTS_FIELD`` can override the common Jira Cloud default
@@ -151,22 +153,19 @@ def fetch_jira_signals(
         return str((issue.get("fields", {}).get("priority") or {}).get("name", "")).casefold()
     critical = sum(1 for issue in active_sprint_open if issue.get("fields", {}).get("issuetype", {}).get("name", "").casefold() == "bug" and severity(issue) == "critical")
     blocker = sum(1 for issue in active_sprint_open if issue.get("fields", {}).get("issuetype", {}).get("name", "").casefold() == "bug" and severity(issue) == "blocker")
-    planned, uses_story_points = _work_units(sprint_issues, story_points_field)
-    completed, _ = _work_units(
-        [issue for issue in sprint_issues if _is_done(issue)], story_points_field
-    )
-    actual_completion = completed / planned if planned > 0 else 0.0
-    active_statuses = {"in progress", "in review", "review"}
-    wip, _ = _work_units([issue for issue in sprint_issues if str((issue.get("fields", {}).get("status") or {}).get("name", "")).casefold() in active_statuses], story_points_field)
-    progress_ratio = min(1.0, (completed + wip * 0.5) / planned) if planned else 0.0
+    # Velocity is exactly Done story points / committed story points.  Do not
+    # credit work in progress, use issue counts, or turn missing sprint data
+    # into a healthy 100% result.
+    planned = _story_point_total(sprint_issues, story_points_field)
+    completed = _story_point_total([issue for issue in sprint_issues if _is_done(issue)], story_points_field)
+    uses_story_points = planned > 0
+    actual_completion = min(1.0, completed / planned) if planned > 0 else None
     start, end = _sprint_window(sprint_issues, sprint_field)
     now = datetime.now(timezone.utc)
     total_days = max(1.0, (end - start).total_seconds() / 86400) if start and end else 0.0
     elapsed_ratio = min(1.0, max(0.0, (now - start).total_seconds() / 86400 / total_days)) if total_days else 0.0
-    deviation = progress_ratio - elapsed_ratio
-    # Only a material (>20 percentage point) gap is a velocity penalty.  On
-    # normal mid-sprint days, elapsed-time pace is treated as on target.
-    velocity = 1.0 if not total_days or deviation >= -0.20 else max(0.0, min(1.0, progress_ratio / max(elapsed_ratio, .01)))
+    deviation = (actual_completion - elapsed_ratio) if actual_completion is not None else None
+    active_sprint = _active_sprint(sprint_issues, sprint_field)
     def is_blocked(issue: dict) -> bool:
         fields = issue.get("fields", {})
         status = str((fields.get("status") or {}).get("name", "")).lower()
@@ -191,16 +190,17 @@ def fetch_jira_signals(
     average_load = sum(assignee_loads.values()) / len(assignee_loads) if assignee_loads else 0.0
     workload_risk = (max(assignee_loads.values()) / average_load - 1.0) if average_load else 0.0
     return {
-        "velocity_percent": round(min(1.0, max(0.0, velocity)), 4),
+        "velocity_percent": round(actual_completion, 4) if actual_completion is not None else None,
         "overdue_rate": round(overdue / len(sprint_issues), 4) if sprint_issues else 0.0,
         "bug_ratio": round((critical + blocker) / len(sprint_issues), 4) if sprint_issues else 0.0,
         "active_sprint_issue_count": len(sprint_issues),
         "committed_story_pts": round(planned, 2),
-        "completed_story_pts": round(completed + wip * 0.5, 2),
+        "completed_story_pts": round(completed, 2),
         "actual_completed_story_pts": round(completed, 2),
-        "wip_credit_story_pts": round(wip * 0.5, 2),
+        "remaining_story_pts": round(max(0.0, planned - completed), 2) if planned > 0 else None,
+        "wip_credit_story_pts": 0.0,
         "expected_velocity_ratio": round(elapsed_ratio, 4),
-        "velocity_deviation": round(deviation, 4),
+        "velocity_deviation": round(deviation, 4) if deviation is not None else None,
         "is_sprint_active": bool(sprint_issues),
         "active_sprint_uses_story_points": uses_story_points,
         "open_issue_count": total_open,
@@ -211,7 +211,11 @@ def fetch_jira_signals(
         # Current operational evidence used for dashboard risk analysis and
         # persisted beside every prediction. These are never stale score
         # contributions: they are replaced on every Jira sync.
-        "sprint_completion": round(velocity, 4),
+        "sprint_completion": round(actual_completion, 4) if actual_completion is not None else None,
+        "active_sprint_name": active_sprint.get("name") if active_sprint else None,
+        "active_sprint_start": start.isoformat() if start else None,
+        "active_sprint_end": end.isoformat() if end else None,
+        "velocity_last_calculated": now.isoformat(),
         "original_estimate_seconds": round(original_estimate, 2),
         "remaining_estimate_seconds": round(remaining_estimate, 2),
         "remaining_estimate_ratio": round(remaining_estimate / original_estimate, 4) if original_estimate else 0.0,

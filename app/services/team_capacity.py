@@ -112,14 +112,19 @@ class TeamCapacityService:
                 typ = link.get("type") or {}
                 inward = str(typ.get("inward", "")).lower()
                 outward = str(typ.get("outward", "")).lower()
-                if any(term in outward for term in ("blocks", "depends on")) and (target := link.get("outwardIssue", {}).get("key")) in known:
+                # Jira administrators can rename link labels.  Treat the
+                # standard blocker/dependency directions equivalently while
+                # preserving the source -> dependent graph orientation.
+                if any(term in outward for term in ("blocks", "depends on", "is blocked by", "blocked by", "depends upon")) and (target := link.get("outwardIssue", {}).get("key")) in known:
                     edges.add((item["key"], target))
-                if any(term in inward for term in ("blocks", "depends on")) and (source := link.get("inwardIssue", {}).get("key")) in known:
+                if any(term in inward for term in ("blocks", "depends on", "is blocked by", "blocked by", "depends upon")) and (source := link.get("inwardIssue", {}).get("key")) in known:
                     edges.add((source, item["key"]))
             # Jira's parent field is a dependency relation even when an
             # instance has no explicit issue-link record for it.
             if item["parent"] in known:
                 edges.add((item["parent"], item["key"]))
+            if item["epic"] in known:
+                edges.add((item["epic"], item["key"]))
         return sorted(edges)
 
     @staticmethod
@@ -277,13 +282,16 @@ class TeamCapacityService:
             projected_completion = now + timedelta(seconds=remaining_points / point_rate) if point_rate else None
 
         historical_sprints = defaultdict(float)
+        historical_by_developer = defaultdict(lambda: defaultdict(float))
         sprint_field = os.getenv("JIRA_SPRINT_FIELD", "customfield_10020")
         for raw in snapshot.get("historical_completed_issues", []):
             item = cls._issue(raw, snapshot["story_points_field"])
             value = raw.get("fields", {}).get(sprint_field) or raw.get("fields", {}).get("sprint")
             for sprint in value if isinstance(value, list) else [value]:
                 if isinstance(sprint, dict) and sprint.get("state", "").upper() == "CLOSED":
-                    historical_sprints[str(sprint.get("id") or sprint.get("name"))] += item["points"]
+                    sprint_key = str(sprint.get("id") or sprint.get("name"))
+                    historical_sprints[sprint_key] += item["points"]
+                    historical_by_developer[item["assignee"]][sprint_key] += item["points"]
         velocity_trend = (sum(historical_sprints.values()) / len(historical_sprints)) if historical_sprints else None
         blocked = [by_key[key] for key in blocked_keys]
         affected = sorted({item["assignee"] for item in blocked})
@@ -313,6 +321,11 @@ class TeamCapacityService:
             member["late_tasks"] = sum(1 for item in owned if _parse_date(item["due_date"]) and _parse_date(item["due_date"]) < now and not item["done"])
             member["upcoming_due_tasks"] = sum(1 for item in owned if _parse_date(item["due_date"]) and now <= _parse_date(item["due_date"]) <= now + timedelta(days=3))
             member["dependency_count"] = sum(1 for source, target in edges if source in {item["key"] for item in owned} or target in {item["key"] for item in owned})
+            member["bug_tasks"] = sum(1 for item in owned if "bug" in item["issue_type"].casefold() and not item["done"])
+            member["historical_capacity_story_points"] = round(
+                sum(historical_by_developer[member["developer"]].values()) / len(historical_by_developer[member["developer"]])
+                if historical_by_developer[member["developer"]] else 0.0, 2
+            )
 
         # The active sprint drives health, burndown and capacity.  The board
         # roster is broader: Jira users with assigned backlog/future/completed
@@ -346,7 +359,12 @@ class TeamCapacityService:
                 "late_tasks": sum(1 for item in unresolved if _parse_date(item["due_date"]) and _parse_date(item["due_date"]) < now),
                 "upcoming_due_tasks": sum(1 for item in unresolved if _parse_date(item["due_date"]) and now <= _parse_date(item["due_date"]) <= now + timedelta(days=3)),
                 "dependency_count": 0, "risk": "Low", "status": "No active sprint work",
-                "recommendation": "No active-sprint work is assigned; Jira board history is shown for roster visibility.",
+                "bug_tasks": sum(1 for item in unresolved if "bug" in item["issue_type"].casefold()),
+                "historical_capacity_story_points": round(
+                    sum(historical_by_developer[developer].values()) / len(historical_by_developer[developer])
+                    if historical_by_developer[developer] else 0.0, 2
+                ),
+                "recommendation": None,
             })
 
         no_active_sprint = not sprint.get("name")
@@ -371,11 +389,85 @@ class TeamCapacityService:
         }
 
     @classmethod
+    def add_developer_recommendations(cls, analysis: dict, score, email_count: int = 0, transcript_count: int = 0,
+                                      snapshot: dict | None = None) -> None:
+        """Attach explainable, request-time workload actions to every developer.
+
+        This deliberately derives text, priority, transfer quantities and confidence
+        from the current Jira snapshot and health/communication observations. Nothing
+        is persisted, so a Jira or communication sync changes the next response.
+        """
+        members = analysis["team_capacity"]
+        items = analysis["_items"]
+        now = datetime.now(timezone.utc)
+        total_items = max(1, len(items))
+        complete_items = sum(bool(item["assignee"]) and item["points"] >= 0 and item["remaining_seconds"] >= 0 for item in items)
+        sprint = analysis["active_sprint"]
+        sprint_coverage = float(bool(sprint.get("name") and sprint.get("start_date") and sprint.get("end_date")))
+        communication_count = email_count + transcript_count
+        communication_coverage = min(1.0, communication_count / max(1, len(members)))
+        fetched_at = _parse_date((snapshot or {}).get("fetched_at"))
+        jira_freshness = max(0.0, 1 - max(0.0, (now - fetched_at).total_seconds() / 86400) / 7) if fetched_at else 0.5
+        confidence = round(100 * (.45 * complete_items / total_items + .30 * sprint_coverage + .15 * jira_freshness + .10 * communication_coverage), 1)
+        project_bug_ratio = max(0.0, min(1.0, float(getattr(score, "bug_ratio", 0) or 0)))
+        negative_sentiment = float(getattr(score, "tone_score", 0) or 0) < 0 and communication_count > 0
+
+        def points(value: float) -> str:
+            return f"{value:.0f}" if float(value).is_integer() else f"{value:.1f}"
+
+        for member in members:
+            assigned = float(member["current_story_points"])
+            historical = float(member.get("historical_capacity_story_points") or 0)
+            capacity = float(member["capacity_percentage"])
+            blockers, overdue = int(member["blocked_tasks"]), int(member["late_tasks"])
+            actions: list[dict] = []
+            available_points = max(0.0, historical - assigned) if historical else 0.0
+            candidates = [candidate for candidate in members if candidate["developer"] != member["developer"] and candidate["is_active_in_sprint"] and candidate["capacity_percentage"] < 50]
+            recipient = max(candidates, key=lambda candidate: (float(candidate.get("historical_capacity_story_points") or 0) - float(candidate["current_story_points"]), -candidate["capacity_percentage"]), default=None)
+
+            if capacity > 120:
+                transfer = max(1.0, assigned - historical) if historical else max(1.0, assigned * (capacity - 100) / capacity)
+                target = f" to {recipient['developer']}" if recipient else " to an available team member"
+                actions.append({"priority": "Critical", "message": f"Critical overload detected at {capacity:.0f}% capacity. Immediately redistribute approximately {points(transfer)} Story Points{target}.", "why": f"Assigned work is {points(max(0, assigned - historical))} Story Points above historical capacity." if historical else "Remaining estimates exceed the sprint work window by more than 20%."})
+            elif capacity > 100:
+                transfer = max(1.0, assigned - historical) if historical else max(1.0, assigned * (capacity - 100) / capacity)
+                target = f" to {recipient['developer']}" if recipient else " to an available team member"
+                actions.append({"priority": "High", "message": f"Developer is overloaded. Reassign approximately {points(transfer)} Story Points{target}.", "why": f"Capacity is {capacity:.0f}%" + (f" versus {points(historical)} historical Story Points." if historical else " based on live remaining estimates.")})
+            if blockers:
+                priority = "High" if capacity <= 100 else "Critical"
+                message = f"Resolve {blockers} blocked issue{'s' if blockers != 1 else ''} before assigning additional work."
+                if capacity > 90:
+                    message = f"Resolve the {blockers} blocked issue{'s' if blockers != 1 else ''} and dependency chain before reallocating work."
+                actions.append({"priority": priority, "message": message, "why": f"{blockers} active Jira issue{' is' if blockers == 1 else 's are'} blocked."})
+            if overdue:
+                actions.append({"priority": "High", "message": f"Prioritize overdue work before starting new tasks. Overdue tickets: {overdue}.", "why": "Open Jira due dates are earlier than today."})
+            if member.get("bug_tasks", 0) and project_bug_ratio >= .25:
+                actions.append({"priority": "Medium", "message": "Focus on resolving critical defects before implementing new features.", "why": f"The project bug ratio is {project_bug_ratio:.0%}, with {member['bug_tasks']} active bug task(s) assigned."})
+            if negative_sentiment:
+                actions.append({"priority": "High", "message": "Schedule a team check-in before increasing workload.", "why": f"Communication analysis is negative across {communication_count} synced email/transcript record(s)."})
+            if member["is_active_in_sprint"] and capacity < 50 and assigned > 0 and available_points > 0:
+                actions.append({"priority": "Available", "message": f"Available for task reassignment. Recommended to receive up to {points(available_points)} Story Points.", "why": f"Current assignment is {points(assigned)} versus {points(historical)} historical Story Points."})
+            if not member["is_active_in_sprint"] or member["remaining_tasks"] == 0:
+                actions.append({"priority": "Available", "message": "No active work assigned. Candidate for future sprint planning.", "why": "No unresolved Jira issues are assigned in the active sprint."})
+            if not actions and 60 <= capacity <= 90:
+                actions.append({"priority": "Low", "message": "Workload is healthy. No intervention required.", "why": f"Capacity is {capacity:.0f}% and there are no active blockers or overdue issues."})
+            if not actions:
+                actions.append({"priority": "Low", "message": "Monitor current workload as sprint estimates change.", "why": f"Capacity is {capacity:.0f}% with no immediate delivery intervention signal."})
+            priority_order = {"Critical": 4, "High": 3, "Medium": 2, "Available": 1, "Low": 0}
+            actions.sort(key=lambda action: priority_order[action["priority"]], reverse=True)
+            member["recommendations"] = actions
+            member["recommendation"] = " ".join(action["message"] for action in actions)
+            member["recommendation_priority"] = actions[0]["priority"]
+            member["recommendation_confidence"] = confidence
+            member["recommendation_confidence_factors"] = {"jira_data_completeness": round(complete_items / total_items * 100, 1), "jira_freshness": round(jira_freshness * 100, 1), "communication_coverage": round(communication_coverage * 100, 1), "sprint_coverage": round(sprint_coverage * 100, 1)}
+
+    @classmethod
     def dashboard(cls, snapshot: dict, project, score, email_count: int = 0, transcript_count: int = 0) -> dict:
         """One frontend-ready payload built solely from the synced Jira snapshot and model output."""
         analysis = cls.analyse(snapshot)
         dependency, burndown, members = analysis["dependency_analysis"], analysis["burndown"], analysis["team_capacity"]
         risk = cls._delivery_risk(analysis, score, project)
+        cls.add_developer_recommendations(analysis, score, email_count, transcript_count, snapshot)
         confidence = round(100 - risk["score"], 2)
         return {
             "project_id": project.id, "generated_at": datetime.now(timezone.utc).isoformat(),

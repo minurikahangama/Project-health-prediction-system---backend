@@ -47,7 +47,6 @@ class TranscriptService:
         remaining = self.db.query(TranscriptUpload).filter_by(project_id=project.id).all()
         result = PredictionService(self.db).recalculate(
             project, analysis_source="transcript_deleted",
-            neutral_when_no_transcripts=not remaining,
         )
         invalidate_project_health_cache(project.id)
         logger.info("Transcript %s deleted for Project %s. Health Score recalculated from %.2f -> %.2f.", deleted_id, project.id, old_score, result["health_score"])

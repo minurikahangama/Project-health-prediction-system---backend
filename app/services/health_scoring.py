@@ -34,7 +34,10 @@ def delivery_deductions(metrics: Mapping[str, object] | None) -> dict[str, float
     expected = clamp(float(metrics.get("expected_velocity_ratio") or 0), 0, 1)
     actual = clamp(completed / committed, 0, 1) if committed else 0.0
     velocity = 0.0
-    if active and committed > 0 and expected > 0 and actual < expected:
+    # A sprint needs enough elapsed time before progress is meaningful.  Once
+    # it is, allow a 10% progress tolerance before applying a proportional
+    # velocity deduction.
+    if active and committed > 0 and expected > .10 and actual < expected * .90:
         velocity = min(35.0, 35.0 * (1.0 - actual / expected))
 
     tickets = max(0, int(metrics.get("active_sprint_issue_count") or 0))
@@ -46,7 +49,10 @@ def delivery_deductions(metrics: Mapping[str, object] | None) -> dict[str, float
         critical_count = max(0, int(metrics.get("open_bug_count") or 0))
     overdue = min(20.0, 20.0 * ((overdue_count / tickets) / .20)) if tickets else 0.0
     bug = min(25.0, 25.0 * ((critical_count / tickets) / .15)) if tickets else 0.0
-    return {"velocity": velocity, "overdue": overdue, "bug": bug, "total": velocity + overdue + bug}
+    # The delivery portion of the top-down model is deliberately bounded,
+    # even when several independent Jira risks are present at once.
+    return {"velocity": velocity, "overdue": overdue, "bug": bug,
+            "total": min(50.0, velocity + overdue + bug)}
 
 
 def decay_weight(timestamp: datetime | None, now: datetime | None = None) -> float:

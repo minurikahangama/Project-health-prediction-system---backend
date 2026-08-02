@@ -13,10 +13,10 @@ def generate_shap_explanation(model, feature_vector, feature_names):
     shap_values = np.asarray(explainer.shap_values(vector))
     expected = np.asarray(explainer.expected_value).reshape(-1)[0]
     waterfall = [{
-        "feature": name, "raw_value": float(value), "shap_impact": round(float(impact), 2),
+        "feature": name, "raw_value": float(value), "shap_impact": round(float(impact), 6),
         "direction": "positive" if impact >= 0 else "negative",
     } for name, value, impact in zip(feature_names, vector[0], shap_values[0])]
-    return {"base_value": round(float(expected), 2), "waterfall": waterfall,
+    return {"base_value": round(float(expected), 6), "waterfall": waterfall,
             "feature_importance": sorted(waterfall, key=lambda item: abs(item["shap_impact"]), reverse=True)}
 
 

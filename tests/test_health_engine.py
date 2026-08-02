@@ -36,8 +36,10 @@ class _Session:
 class HealthEngineDeletionTests(unittest.TestCase):
     def test_transcript_removal_returns_to_pre_transcript_baseline(self):
         baseline = prepare_advanced_features({"tone_score": 0.0, "is_brand_new": True})["ground_truth_score"]
+        # Positive communication is a recovery, not a bonus above the 100
+        # point baseline.
         raised = prepare_advanced_features({"tone_score": .9, "is_brand_new": True})["ground_truth_score"]
-        self.assertGreater(raised, baseline)
+        self.assertEqual(raised, baseline)
 
         transcript = SimpleNamespace(id=7, project_id=1, storage_filename="x.txt")
         project = SimpleNamespace(id=1)
@@ -46,7 +48,7 @@ class HealthEngineDeletionTests(unittest.TestCase):
             scorer.return_value.recalculate.return_value = {"health_score": baseline}
             result = TranscriptService(session).delete_transcript("7")
         self.assertEqual(result["health_score"], baseline)
-        self.assertTrue(scorer.return_value.recalculate.call_args.kwargs["neutral_when_no_transcripts"])
+        self.assertEqual(scorer.return_value.recalculate.call_args.kwargs["analysis_source"], "transcript_deleted")
 
     def test_total_transcript_clear_resets_to_neutral_feature(self):
         processed = prepare_advanced_features({"tone_score": 0.0, "days_since_last_transcript": None})

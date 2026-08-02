@@ -170,6 +170,11 @@ async def startup_event():
         connection.execute(text(
             "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS shap_explanation JSON"
         ))
+        # Keep existing local/managed PostgreSQL databases compatible with
+        # the live dashboard audit fields even before Alembic is run.
+        connection.execute(text(
+            "ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS deduction_snapshot JSON"
+        ))
         connection.execute(text("ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS open_issues INTEGER DEFAULT 0"))
         connection.execute(text("ALTER TABLE health_scores ADD COLUMN IF NOT EXISTS open_bugs INTEGER DEFAULT 0"))
         connection.execute(text(

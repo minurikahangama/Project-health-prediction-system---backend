@@ -85,6 +85,16 @@ class TeamCapacityTests(unittest.TestCase):
         self.assertGreaterEqual(risk["score"], 0)
         self.assertLessEqual(risk["score"], 100)
 
+    def test_developer_recommendations_are_explainable_and_snapshot_derived(self):
+        analysis = TeamCapacityService.analyse(self.snapshot)
+        TeamCapacityService.add_developer_recommendations(analysis, self.score, email_count=2, transcript_count=1, snapshot=self.snapshot)
+        emma = next(row for row in analysis["team_capacity"] if row["developer"] == "Emma")
+        self.assertTrue(emma["recommendations"])
+        self.assertIn("blocked", emma["recommendation"].lower())
+        self.assertIn(emma["recommendation_priority"], {"Critical", "High", "Medium", "Low", "Available"})
+        self.assertGreaterEqual(emma["recommendation_confidence"], 0)
+        self.assertLessEqual(emma["recommendation_confidence"], 100)
+
     def test_no_active_sprint_is_explicit_not_zero_filled(self):
         snapshot = {**self.snapshot, "active_sprint": {"name": None, "start_date": None, "end_date": None}, "issues": []}
         analysis = TeamCapacityService.analyse(snapshot)

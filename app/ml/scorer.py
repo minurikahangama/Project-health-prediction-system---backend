@@ -1,6 +1,7 @@
 """Public scoring facade for the PHPS seven-feature fusion pipeline."""
 from __future__ import annotations
 from typing import Dict
+from datetime import datetime, timezone
 from app.services.feature_processor import prepare_advanced_features
 from app.services.health_policy import baseline_score
 from app.services.health_scoring import delivery_deductions, health_score, status_for_score
@@ -64,10 +65,51 @@ def compute_health_score(tone_score: float, urgency_flag: int, velocity_percent:
         result = health_score(metrics, items, green_threshold, red_threshold)
         delivery, communication = result["delivery"], result["communication"]
         score = result["health_score"]
+        deadline = _ignored.get("deadline")
+        if deadline:
+            deadline = deadline.replace(tzinfo=timezone.utc) if deadline.tzinfo is None else deadline
+            days_to_deadline = max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds() / 86400)
+        else:
+            days_to_deadline = 0.0
+        feature_names = ("overall_sentiment", "urgency_count", "velocity", "overdue_rate", "bug_ratio",
+                         "open_issues", "open_bugs", "email_count", "transcript_count", "days_to_deadline",
+                         "sentiment_trend", "velocity_trend", "bug_trend")
+        model_features = {
+            "overall_sentiment": tone_score, "urgency_count": urgency_count if urgency_count is not None else urgency_flag,
+            "velocity": velocity_percent, "overdue_rate": overdue_rate, "bug_ratio": bug_ratio,
+            "open_issues": open_issues, "open_bugs": open_bugs, "email_count": _ignored.get("email_count", 0),
+            "transcript_count": _ignored.get("transcript_count", 0), "days_to_deadline": days_to_deadline,
+            "sentiment_trend": _ignored.get("sentiment_trend", 0.0), "velocity_trend": _ignored.get("velocity_trend", 0.0),
+            "bug_trend": _ignored.get("bug_trend", 0.0),
+        }
+        try:
+            from app.ml.xgb_fusion import predict_with_shap
+            # TreeSHAP explains feature influence, but must not create a
+            # second score that conflicts with the deduction policy.
+            _, shap, _ = predict_with_shap(model_features, feature_names)
+            source = "XGBoost ML Fusion Model"
+            shap_values = {item["feature"]: item["shap_impact"] for item in shap["waterfall"]}
+            evidence_total = sum(max(0.0, float(model_features[name])) for name in (
+                "open_issues", "email_count", "transcript_count"
+            ))
+            confidence = round(100 * (1 - 1 / (1 + evidence_total)), 2)
+            ranked = sorted(shap["waterfall"], key=lambda item: abs(item["shap_impact"]), reverse=True)
+            positive = [item["feature"] for item in ranked if item["shap_impact"] > 0][:5]
+            negative = [item["feature"] for item in ranked if item["shap_impact"] < 0][:5]
+            shap.update({
+                "model_version": "XGBoost v3.2", "confidence": confidence,
+                "lineage": {"jira_issues": model_features["open_issues"], "emails": model_features["email_count"],
+                            "meeting_transcripts": model_features["transcript_count"]},
+                "positive_drivers": positive, "negative_drivers": negative,
+            })
+        except Exception:
+            source, shap, shap_values = "Deterministic Fallback Engine", None, None
+        rag_status = "GREEN" if score >= green_threshold else "RED" if score < red_threshold else "AMBER"
         return {
-            "health_score": score, "ground_truth_score": score, "rag_status": result["rag_status"],
-            "divergence_flag": result["divergence_flag"], "prediction_source": "Deterministic Project Health Scoring Engine",
-            "prediction_version": "PHPS Deduction Engine v2", "feature_vector": dict(metrics), "shap_values": None,
+            "health_score": score, "ground_truth_score": result["health_score"], "rag_status": rag_status,
+            "divergence_flag": result["divergence_flag"], "prediction_source": source,
+            "prediction_version": "PHPS XGBoost + TreeSHAP v1", "feature_vector": model_features, "shap_values": shap_values,
+            "shap_explanation": shap,
             "score_analysis": {"baseline": 100.0, "sprint_velocity_penalty": -round(delivery["velocity"], 2),
                 "overdue_rate_penalty": -round(delivery["overdue"], 2), "bug_ratio_penalty": -round(delivery["bug"], 2),
                 "delivery_deduction": -round(delivery["total"], 2), "communication_deduction": -round(communication["total"], 2),

@@ -47,13 +47,32 @@ class DecisionSupportService:
 
     @staticmethod
     def _values(score, values=None):
-        return values or {
+        base = {
             "sprint_velocity": float(score.velocity_percent),
             "bug_ratio": float(score.bug_ratio),
             "overdue_rate": float(score.overdue_rate),
             "communication_sentiment": float(score.tone_score),
             "urgency_flag": int(score.urgency_flag),
         }
+        return {**base, **(values or {})}
+
+    @staticmethod
+    def _operational_values(values: dict) -> dict:
+        """Apply unsaved operational controls to model inputs.
+
+        Jira-derived operational controls affect the measurable delivery
+        inputs, while the original control values remain in the response for
+        auditability.  Nothing is written to the database.
+        """
+        adjusted = dict(values)
+        capacity = max(0.0, min(100.0, float(values.get("available_capacity", 100.0)))) / 100
+        absence = max(0.0, float(values.get("developer_absence_days", 0.0)))
+        blocked = max(0.0, float(values.get("blocked_story_points", 0.0)))
+        critical_bugs = max(0, int(values.get("critical_bugs", 0)))
+        adjusted["sprint_velocity"] = max(0.0, min(1.0, float(values["sprint_velocity"]) * capacity / (1 + absence / 5)))
+        adjusted["overdue_rate"] = max(0.0, min(1.0, float(values["overdue_rate"]) + blocked / max(1.0, blocked + 40.0)))
+        adjusted["bug_ratio"] = max(0.0, min(1.0, float(values["bug_ratio"]) + critical_bugs / max(1.0, critical_bugs + 20.0)))
+        return adjusted
 
     @staticmethod
     def _display_name(metric: str) -> str:
@@ -101,7 +120,7 @@ class DecisionSupportService:
         }
 
     @classmethod
-    def _simulate_metric(cls, project, score, values, metric_spec, email_count, transcript_count, current_score):
+    def _simulate_metric(cls, project, score, values, metric_spec, email_count, transcript_count, current_score, score_offset):
         metric, shap_feature, lower, upper, direction = metric_spec
         current = float(values[metric])
         simulations = []
@@ -113,7 +132,7 @@ class DecisionSupportService:
             if proposed[metric] in seen_targets:
                 continue
             seen_targets.add(proposed[metric])
-            prediction = AIInsightsService.simulate(project, score, proposed, email_count, transcript_count)
+            prediction = AIInsightsService.simulate(project, score, proposed, email_count, transcript_count, score_offset)
             simulations.append({
                 "metric": metric, "current": current, "target": proposed[metric],
                 "predicted_score": prediction["predicted_score"],
@@ -159,7 +178,7 @@ class DecisionSupportService:
         return action, simulations
 
     @classmethod
-    def _delivery_counterfactuals(cls, project, score, values, capacity_analysis, email_count, transcript_count, current_score):
+    def _delivery_counterfactuals(cls, project, score, values, capacity_analysis, email_count, transcript_count, current_score, score_offset):
         """Generate capacity/dependency alternatives from the live Jira graph.
 
         The targets are a consequence of the present workload graph and
@@ -179,7 +198,7 @@ class DecisionSupportService:
             if target_velocity <= values["sprint_velocity"]:
                 return
             proposed = {**values, "sprint_velocity": target_velocity}
-            prediction = AIInsightsService.simulate(project, score, proposed, email_count, transcript_count)
+            prediction = AIInsightsService.simulate(project, score, proposed, email_count, transcript_count, score_offset)
             gain = round(prediction["predicted_score"] - current_score, 2)
             simulation = {"metric": "sprint_velocity", "current": values["sprint_velocity"], "target": target_velocity,
                           "predicted_score": prediction["predicted_score"], "gain": gain,
@@ -229,7 +248,7 @@ class DecisionSupportService:
         return actions, simulations
 
     @classmethod
-    def _recovery_plan(cls, project, score, values, recommendations, email_count, transcript_count, current_score):
+    def _recovery_plan(cls, project, score, values, recommendations, email_count, transcript_count, current_score, score_offset):
         """Turn selected actions into sequential, re-predicted execution steps."""
         running_values = dict(values)
         running_score = current_score
@@ -238,7 +257,7 @@ class DecisionSupportService:
         for step, action in enumerate(recommendations, start=1):
             running_values[action["metric"]] = action["target"]
             prediction = AIInsightsService.simulate(
-                project, score, running_values, email_count, transcript_count
+                project, score, running_values, email_count, transcript_count, score_offset
             )
             increase = round(prediction["predicted_score"] - running_score, 2)
             running_score = prediction["predicted_score"]
@@ -265,18 +284,30 @@ class DecisionSupportService:
     @classmethod
     def build(cls, project, score, values=None, email_count=0, transcript_count=0, capacity_analysis=None):
         values = cls._values(score, values)
-        baseline = AIInsightsService.simulate(project, score, values, email_count, transcript_count)
-        current = baseline["predicted_score"]
+        model_values = cls._operational_values(values)
+        raw_baseline = AIInsightsService.simulate(project, score, model_values, email_count, transcript_count)
+        # The dashboard's persisted canonical snapshot is the baseline. Apply
+        # only the model's counterfactual deltas to it during this request.
+        current = round(float(score.health_score), 2)
+        score_offset = current - raw_baseline["predicted_score"]
+        baseline = AIInsightsService.simulate(project, score, model_values, email_count, transcript_count, score_offset)
         actions, simulations = [], []
-        for spec in CONTROLLABLE_METRICS:
+        # Do not offer delivery controls when their Jira evidence is absent,
+        # or communication controls with no communication evidence.
+        available_specs = [
+            spec for spec in CONTROLLABLE_METRICS
+            if (bool(getattr(project, "jira_url", None)) or spec[0] not in {"sprint_velocity", "overdue_rate", "bug_ratio"})
+            and (bool(email_count + transcript_count) or spec[0] != "communication_sentiment")
+        ]
+        for spec in available_specs:
             action, metric_simulations = cls._simulate_metric(
-                project, score, values, spec, email_count, transcript_count, current
+                project, score, model_values, spec, email_count, transcript_count, current, score_offset
             )
             simulations.extend(metric_simulations)
             if action and action["gain"] > 0:
                 actions.append(action)
         delivery_actions, delivery_simulations = cls._delivery_counterfactuals(
-            project, score, values, capacity_analysis, email_count, transcript_count, current
+            project, score, model_values, capacity_analysis, email_count, transcript_count, current, score_offset
         )
         actions.extend(delivery_actions)
         simulations.extend(delivery_simulations)
@@ -303,9 +334,9 @@ class DecisionSupportService:
             # model input rather than an arbitrary duration table.
 
         recovery = cls._recovery_plan(
-            project, score, values, actions, email_count, transcript_count, current
+            project, score, model_values, actions, email_count, transcript_count, current, score_offset
         )
-        final_values = dict(values)
+        final_values = dict(model_values)
         for action in actions:
             final_values[action["metric"]] = action["target"]
         horizon = max(1, min(12, int(max(1, (deadline - datetime.now(timezone.utc)).total_seconds() / 604800))))
@@ -313,14 +344,57 @@ class DecisionSupportService:
         for week in range(horizon + 1):
             fraction = week / horizon
             step_values = {
-                key: values[key] + (final_values[key] - values[key]) * fraction
-                for key in values if key != "urgency_flag"
+                key: model_values[key] + (final_values[key] - model_values[key]) * fraction
+                for key in model_values if key != "urgency_flag" and key in {"sprint_velocity", "bug_ratio", "overdue_rate", "communication_sentiment"}
             }
-            step_values["urgency_flag"] = int(values["urgency_flag"] if fraction < 1 else final_values["urgency_flag"])
-            simulated = AIInsightsService.simulate(project, score, step_values, email_count, transcript_count)
+            step_values["urgency_flag"] = int(model_values["urgency_flag"] if fraction < 1 else final_values["urgency_flag"])
+            simulated = AIInsightsService.simulate(project, score, step_values, email_count, transcript_count, score_offset)
             forecast.append({"week": "Current" if week == 0 else f"Week {week}", "score": simulated["predicted_score"],
                              "lower": simulated["predicted_score"], "upper": simulated["predicted_score"]})
 
+        expected_end = forecast[-1]["score"]
+        worst_values = {
+            **model_values,
+            "sprint_velocity": max(0.0, model_values["sprint_velocity"] * .75),
+            "overdue_rate": min(1.0, model_values["overdue_rate"] + .15),
+            "bug_ratio": min(1.0, model_values["bug_ratio"] + .10),
+            "communication_sentiment": max(-1.0, model_values["communication_sentiment"] - .15),
+        }
+        worst_case = AIInsightsService.simulate(project, score, worst_values, email_count, transcript_count, score_offset)["predicted_score"]
+        delivery_risk = cls._capacity_risks(capacity_analysis)
+        evidence_count = email_count + transcript_count
+        deadline_confidence = round(max(0.0, min(100.0, expected_end - 35 * delivery_risk["burndown"] - 25 * delivery_risk["dependency"])), 2)
+        recovery_probability = round(max(0.0, min(100.0, (expected_end - current + 50) * (0.55 + min(0.4, evidence_count / 25)))), 2)
+        stability = round(max(0.0, min(100.0, 100 - abs(expected_end - current) * 4 - (max(delivery_risk.values()) * 45))), 2)
+        availability = {
+            "jira": capacity_analysis is not None,
+            "communication": bool(evidence_count),
+            "emails": email_count,
+            "transcripts": transcript_count,
+            "velocity_prediction": bool(capacity_analysis and capacity_analysis.get("active_sprint")),
+        }
+        # Confidence expresses evidence coverage, not recommendation success.
+        confidence = min(100, round(
+            25 + (35 if availability["jira"] else 0) + (20 if email_count else 0)
+            + (15 if transcript_count else 0) + min(5, len(actions))
+        ))
+        alerts = []
+        if availability["jira"] and values["sprint_velocity"] < .6:
+            alerts.append({"severity": "warning", "message": "Sprint velocity is below the expected delivery pace."})
+        if availability["jira"] and values["overdue_rate"] > .15:
+            alerts.append({"severity": "warning", "message": f"{values['overdue_rate'] * 100:.0f}% overdue work may affect delivery confidence."})
+        if availability["jira"] and values["bug_ratio"] > .1:
+            alerts.append({"severity": "critical", "message": f"{values['bug_ratio'] * 100:.0f}% bug ratio is a material forecast risk."})
+        if availability["communication"]:
+            alerts.append({"severity": "positive" if values["communication_sentiment"] >= 0 else "warning", "message": "Communication sentiment supports project confidence." if values["communication_sentiment"] >= 0 else "Communication sentiment is reducing project confidence."})
+        if expected_end > current:
+            alerts.append({"severity": "positive", "message": "The simulated recovery trajectory is improving."})
+        shap_values = baseline.get("shap_values") or {}
+        influential_feature = min(shap_values, key=lambda key: shap_values[key]) if shap_values else None
+        risk_reason = (
+            f"TreeSHAP identifies {cls._display_name(influential_feature).lower()} as the strongest negative current contribution."
+            if influential_feature else "There is not enough model evidence to identify a dominant risk feature."
+        )
         return {
             "current_score": current, "current_health": current,
             "predicted_next_score": forecast[min(1, len(forecast) - 1)]["score"],
@@ -328,7 +402,7 @@ class DecisionSupportService:
             "trend_reason": "Every point is a fresh XGBoost simulation of the selected actions.",
             "forecast": forecast, "scenarios": actions, "simulation_results": simulations,
             "action_planner": actions, "recommendations": actions, "recovery_plan": recovery,
-            "decision_simulator": {"metrics": values, "prediction": current,
+            "decision_simulator": {"metrics": values, "model_metrics": model_values, "prediction": current,
                                    "shap_values": baseline["shap_values"], "feature_vector": baseline["feature_vector"]},
             "capacity_risk_scores": cls._capacity_risks(capacity_analysis),
             "risk_level": baseline["rag_status"], "metrics": {
@@ -336,8 +410,14 @@ class DecisionSupportService:
                 "velocity_percent": values["sprint_velocity"], "overdue_rate": values["overdue_rate"],
                 "bug_ratio": values["bug_ratio"],
             },
-            "risk_reason": "Recommendations are ranked by fresh XGBoost simulations and their TreeSHAP evidence.",
-            "primary_causes": [action["metric"] for action in actions],
-            "scenario_futures": {"best_case": forecast[-1]["score"], "expected_case": forecast[-1]["score"], "worst_case": current},
-            "projected_score_at_deadline": forecast[-1]["score"], "timeline_horizon_weeks": horizon,
+            "risk_reason": risk_reason,
+            "primary_causes": ([influential_feature] if influential_feature else []) + [action["metric"] for action in actions if action["metric"] != influential_feature],
+            "scenario_futures": {"best_case": expected_end, "expected_case": forecast[min(1, len(forecast) - 1)]["score"], "worst_case": worst_case},
+            "projected_score_at_deadline": expected_end, "predicted_sprint_end_score": expected_end,
+            "predicted_7_day_score": forecast[min(1, len(forecast) - 1)]["score"],
+            "deadline_confidence": deadline_confidence, "recovery_probability": recovery_probability,
+            "prediction_confidence": confidence, "alerts": alerts,
+            "project_stability": "Stable" if stability >= 70 else "Watch" if stability >= 40 else "Unstable",
+            "stability_score": stability, "data_availability": availability,
+            "timeline_horizon_weeks": horizon,
         }

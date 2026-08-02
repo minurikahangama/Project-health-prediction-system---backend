@@ -1,5 +1,5 @@
 """Authenticated API endpoints for calibrated health analytics."""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,7 @@ from app.services.absence_simulator import AbsenceSimulator
 from app.services.decision_support import DecisionSupportService
 from app.services.ai_project_assistant import AIProjectAssistant
 from app.services.identity_resolver import IdentityResolver
+from app.services.system_evaluation import SystemEvaluationService
 from app.utils.database import get_db
 
 router = APIRouter()
@@ -76,6 +77,50 @@ def _capacity_recommendations(project, score, analysis, db: Session) -> dict:
         capacity_analysis=analysis,
     )
 
+
+def _evaluation(project_id: int, user: User, db: Session) -> dict:
+    project = _project(project_id, user, db)
+    scores = _scores(project_id, db)
+    return SystemEvaluationService.build(
+        project, scores[-1], scores,
+        db.query(ProcessedEmail).filter_by(project_id=project.id).all(),
+        db.query(TranscriptUpload).filter_by(project_id=project.id).all(),
+    )
+
+
+def _evaluation_pdf(evaluation: dict) -> bytes:
+    """Small dependency-free PDF suitable for the research appendix."""
+    def escape(value):
+        return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    lines = ["PHPS System Evaluation Report", f"Generated: {evaluation['generated_at']}", "",
+             f"Overall PHPS Accuracy: {evaluation.get('overall_phps_accuracy') if evaluation.get('overall_phps_accuracy') is not None else 'Unavailable'}%",
+             f"Health Score Validation: {evaluation['health_score_validation']['status']}",
+             f"Dashboard Consistency: {evaluation['dashboard_consistency']['consistency_score']}%",
+             f"Functional Success Rate: {evaluation.get('functional_success_rate') if evaluation.get('functional_success_rate') is not None else 'Unavailable'}%",
+             f"Capacity Accuracy: {evaluation['capacity_validation'].get('capacity_accuracy') if evaluation['capacity_validation'].get('capacity_accuracy') is not None else 'Unavailable'}%",
+             f"TreeSHAP Validation: {evaluation['treeshap_validation']['status']}",
+             f"Reliability: {evaluation['reliability'].get('reliability') if evaluation['reliability'].get('reliability') is not None else 'Unavailable'}%",
+             "", "Method note: unavailable metrics require labelled outcomes or completed sprint data and are not estimated."]
+    stream = "BT /F1 11 Tf 50 760 Td " + " ".join(f"({escape(line)}) Tj 0 -18 Td" for line in lines) + " ET"
+    objects = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", f"<< /Length {len(stream.encode('latin-1', 'replace'))} >>\nstream\n{stream}\nendstream"]
+    body, offsets = "%PDF-1.4\n", [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(body.encode("latin-1", "replace")))
+        body += f"{index} 0 obj\n{obj}\nendobj\n"
+    xref = len(body.encode("latin-1", "replace"))
+    body += f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n" + "".join(f"{offset:010d} 00000 n \n" for offset in offsets[1:]) + f"trailer\n<< /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+    return body.encode("latin-1", "replace")
+
+
+def _add_live_developer_recommendations(project, score, analysis, db: Session) -> None:
+    """Build the table actions from this request's Jira, health and communication data."""
+    TeamCapacityService.add_developer_recommendations(
+        analysis, score,
+        email_count=db.query(ProcessedEmail).filter_by(project_id=project.id).count(),
+        transcript_count=db.query(TranscriptUpload).filter_by(project_id=project.id).count(),
+        snapshot=project.jira_capacity_snapshot,
+    )
+
 def _features(project: Project, rows: list[HealthScore]) -> list[dict]:
     result, previous = [], None
     for score in rows:
@@ -105,6 +150,19 @@ def forecast(project_id: int, db: Session = Depends(get_db), current_user: User 
     result = TemporalHealthForecaster().forecast(sequence, [row.health_score for row in rows])
     return {"project_id": project.id, "horizon_weeks": 3, "trajectory": [{"week": i+1, "health_score": score} for i, score in enumerate(result["scores"])], "model_source": result["model_source"]}
 
+
+@router.get("/projects/{project_id}/system-evaluation")
+def system_evaluation(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Run a non-mutating, evidence-backed research evaluation."""
+    return _evaluation(project_id, current_user, db)
+
+
+@router.get("/projects/{project_id}/system-evaluation/report.pdf")
+def system_evaluation_report(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    evaluation = _evaluation(project_id, current_user, db)
+    return Response(_evaluation_pdf(evaluation), media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="phps_evaluation_project_{project_id}.pdf"'})
+
 @router.get("/optimize")
 def optimize(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project, rows = _project(project_id, current_user, db), _scores(project_id, db)
@@ -122,6 +180,7 @@ def plan(project_id: int, db: Session = Depends(get_db), current_user: User = De
 def team_capacity_dashboard(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Return the complete dashboard from the newest successfully synced Jira snapshot."""
     project, score, analysis = _capacity_state(project_id, current_user, db)
+    _add_live_developer_recommendations(project, score, analysis, db)
     from app.models.models import ProcessedEmail, TranscriptUpload
     payload = TeamCapacityService.dashboard(
         project.jira_capacity_snapshot, project, score,
@@ -160,7 +219,8 @@ def simulate_team_capacity(project_id: int, body: CapacitySimulation, db: Sessio
 
 @router.get("/projects/{project_id}/team-capacity/developers")
 def team_capacity_developers(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    _, _, analysis = _capacity_state(project_id, current_user, db)
+    project, score, analysis = _capacity_state(project_id, current_user, db)
+    _add_live_developer_recommendations(project, score, analysis, db)
     return {"developers": analysis["team_capacity"], "workload_distribution": analysis["workload_distribution"]}
 
 
@@ -185,8 +245,9 @@ def team_capacity_metrics(project_id: int, db: Session = Depends(get_db), curren
 @router.get("/projects/{project_id}/team-capacity/recommendations")
 def team_capacity_recommendations(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project, score, analysis = _capacity_state(project_id, current_user, db)
+    _add_live_developer_recommendations(project, score, analysis, db)
     planner = _capacity_recommendations(project, score, analysis, db)
-    return {"current_health": planner["current_health"], "recommendations": planner["recommendations"], "shap_values": planner["decision_simulator"]["shap_values"]}
+    return {"current_health": planner["current_health"], "recommendations": planner["recommendations"], "developer_recommendations": analysis["team_capacity"], "shap_values": planner["decision_simulator"]["shap_values"]}
 
 
 @router.post("/projects/{project_id}/team-capacity/ask-ai")

@@ -184,6 +184,9 @@ class HealthScore(Base):
     # this prediction. Never used as the next prediction's health input.
     feature_vector = Column(JSON, nullable=True)
     shap_explanation = Column(JSON, nullable=True)
+    # Exact deduction values calculated from the live evidence at this point
+    # in time. This is audit/history data only, never an input to a later run.
+    deduction_snapshot = Column(JSON, nullable=True)
 
     recorded_at      = Column(DateTime, default=utcnow, index=True)
 

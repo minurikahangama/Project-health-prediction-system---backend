@@ -117,6 +117,10 @@ class HealthSimulationRequest(BaseModel):
     overdue_rate: float
     communication_sentiment: float
     urgency_flag: int
+    blocked_story_points: float = 0.0
+    available_capacity: float = 100.0
+    developer_absence_days: float = 0.0
+    critical_bugs: int = 0
 
     @validator("sprint_velocity", "bug_ratio", "overdue_rate")
     def percentage_in_range(cls, value):
@@ -134,6 +138,24 @@ class HealthSimulationRequest(BaseModel):
     def urgency_is_binary(cls, value):
         if value not in (0, 1):
             raise ValueError("must be 0 or 1")
+        return value
+
+    @validator("blocked_story_points", "developer_absence_days")
+    def non_negative(cls, value):
+        if value < 0:
+            raise ValueError("must be zero or greater")
+        return value
+
+    @validator("available_capacity")
+    def capacity_in_range(cls, value):
+        if not 0 <= value <= 100:
+            raise ValueError("must be between 0 and 100")
+        return value
+
+    @validator("critical_bugs")
+    def critical_bugs_non_negative(cls, value):
+        if value < 0:
+            raise ValueError("must be zero or greater")
         return value
 
 
@@ -194,10 +216,10 @@ def _project_response(project: Project, latest: Optional[HealthScore] = None) ->
         "assigned_pm_name": project.pm.name if project.pm else None,
         # 100 is the planned baseline, not an ML prediction.  It is never
         # written to health_scores and therefore can never become model input.
-        "health_score": round(latest.health_score) if latest else 100,
+        "health_score": round(_canonical_snapshot_score(latest)) if latest else 100,
         "project_state": getattr(project, "project_state", "INITIATION") if not latest else "ACTIVE",
         "raw_health_score": latest.health_score if latest else None,
-        "rag_status": latest.rag_status if latest else "PROJECT_INITIALIZED",
+        "rag_status": _rag_for_score(_canonical_snapshot_score(latest), project.green_threshold, project.red_threshold) if latest else "PROJECT_INITIALIZED",
         "project_status": "AI Prediction Available" if latest else "Project Initialized",
         "is_baseline": latest is None,
         "divergence_flag": latest.divergence_flag if latest else 0,
@@ -220,6 +242,21 @@ def _rag_for_score(score: float, green_threshold: float, red_threshold: float) -
     if score < red_threshold:
         return "RED"
     return "AMBER"
+
+
+def _canonical_snapshot_score(score: HealthScore) -> float:
+    """Return the policy score recorded with a health snapshot.
+
+    New snapshots store their exact deduction inputs.  Reconstructing the
+    policy score from them keeps existing views consistent with the detailed
+    dashboard when an older ML estimate differs from the configured policy.
+    """
+    snapshot = getattr(score, "deduction_snapshot", None) or {}
+    delivery = (snapshot.get("delivery") or {}).get("total") if isinstance(snapshot, dict) else None
+    communication = (snapshot.get("communication") or {}).get("total") if isinstance(snapshot, dict) else None
+    if delivery is not None and communication is not None:
+        return round(max(0.0, min(100.0, baseline_score() - float(delivery) - float(communication))), 2)
+    return round(float(score.health_score), 2)
 
 
 def _stable_display_scores(rows: list[HealthScore]) -> dict[int, int]:
@@ -385,7 +422,7 @@ def update_project(
     if data.green_threshold is not None or data.red_threshold is not None:
         for score_row in db.query(HealthScore).filter(HealthScore.project_id == project.id):
             score_row.rag_status = _rag_for_score(
-                score_row.health_score, next_green, next_red
+                _canonical_snapshot_score(score_row), next_green, next_red
             )
     if data.gmail_filter_email is not None:
         project.gmail_filter_email = data.gmail_filter_email
@@ -504,6 +541,7 @@ def get_health_score(
             },
             "green_threshold": project.green_threshold,
             "red_threshold": project.red_threshold,
+            "active_sprint": None,
         }
 
     # History for charts — ascending order so charts render left → right
@@ -531,8 +569,8 @@ def get_health_score(
             "recorded_at":      row.recorded_at.isoformat(),
             # Charts use the same exact deterministic value as the gauge;
             # presentation rounding must never create a second score state.
-            "score":            round(row.health_score, 2),
-            "health_score":     round(row.health_score, 2),
+            "score":            _canonical_snapshot_score(row),
+            "health_score":     _canonical_snapshot_score(row),
             "raw_health_score": row.health_score,
             "tone":             row.tone_score,
             "urgency_flag":     row.urgency_flag,
@@ -540,6 +578,11 @@ def get_health_score(
             "overdue_rate":      row.overdue_rate,
             "bug_ratio":         row.bug_ratio,
             "contributions":     _contributions(row),
+            # New snapshots retain the exact deductions calculated at the
+            # time of the run.  Historical rows fall back to the compatible
+            # read-only explanation above.
+            "delivery_deduction": (getattr(row, "deduction_snapshot", None) or {}).get("delivery", {}).get("total"),
+            "communication_deduction": (getattr(row, "deduction_snapshot", None) or {}).get("communication", {}).get("total"),
         }
         for row in history_rows
     ]
@@ -557,6 +600,22 @@ def get_health_score(
     transcript_count = len(transcript_rows)
     has_communication_data = bool(email_count or transcript_count)
     has_jira_data = project.last_jira_synced_at is not None
+    sprint_metrics = getattr(project, "jira_metrics_snapshot", None) or {}
+    velocity = sprint_metrics.get("velocity_percent")
+    active_sprint = None
+    # Older snapshots were produced by the retired pace heuristic and do not
+    # contain this provenance timestamp. They must not be displayed as a
+    # potentially false 100% velocity; the next Jira sync replaces them.
+    if sprint_metrics.get("is_sprint_active") and velocity is not None and sprint_metrics.get("velocity_last_calculated"):
+        active_sprint = {
+            "name": sprint_metrics.get("active_sprint_name"),
+            "committedStoryPoints": sprint_metrics.get("committed_story_pts"),
+            "completedStoryPoints": sprint_metrics.get("actual_completed_story_pts", sprint_metrics.get("completed_story_pts")),
+            "remainingStoryPoints": sprint_metrics.get("remaining_story_pts"),
+            "velocity": velocity,
+            "velocityPercentage": round(float(velocity) * 100, 2),
+            "lastCalculated": sprint_metrics.get("velocity_last_calculated") or project.last_jira_synced_at.isoformat(),
+        }
 
     # ``explain_health_score`` exposes urgency separately for diagnostics.
     # In the dashboard hierarchy it belongs to communication: urgency is
@@ -627,16 +686,18 @@ def get_health_score(
     delivery_metrics_value = dashboard_contributions["delivery_metrics"]
     total_contribution = dashboard_contributions["total_contribution"]
 
+    canonical_score = _canonical_snapshot_score(latest)
+    canonical_rag = _rag_for_score(canonical_score, project.green_threshold, project.red_threshold)
     return {
         "project_name":    project.name,
         "deadline":        project.deadline.isoformat(),
         # Latest score
-        "health_score":    round(latest.health_score, 2),
+        "health_score":    canonical_score,
         "raw_health_score": latest.health_score,
         "baseline": 100.0,
         "delivery_deduction": contribs["delivery_deduction"],
         "communication_deduction": contribs["communication_deduction"],
-        "final_health_score": latest.health_score,
+        "final_health_score": canonical_score,
         "breakdown": {
             "sprint_velocity_penalty": contribs["sprint_velocity_penalty"],
             "overdue_rate_penalty": contribs["overdue_rate_penalty"],
@@ -647,10 +708,12 @@ def get_health_score(
         },
         "is_baseline": False,
         "project_status": "AI Prediction Available" if has_jira_data else "Initiation / Awaiting Data Sync",
-        "rag_status":      latest.rag_status,
+        "rag_status":      canonical_rag,
         "tone_score":      latest.tone_score,
         "urgency_flag":    latest.urgency_flag,
-        "velocity_percent": latest.velocity_percent if has_jira_data else None,
+        # The dashboard renders this authoritative active-sprint value
+        # directly; no historical score, fallback, or client calculation.
+        "velocity_percent": active_sprint["velocity"] if active_sprint else None,
         "overdue_rate":    latest.overdue_rate if has_jira_data else None,
         "bug_ratio":       latest.bug_ratio if has_jira_data else None,
         "divergence_flag": latest.divergence_flag,
@@ -670,6 +733,7 @@ def get_health_score(
         "last_jira_synced_by": project.last_jira_synced_by,
         "last_email_synced_at": project.last_email_synced_at.isoformat() if project.last_email_synced_at else None,
         "last_email_synced_by": project.last_email_synced_by,
+        "active_sprint": active_sprint,
         # Thresholds (for chart reference lines)
         "green_threshold": project.green_threshold,
         "red_threshold":   project.red_threshold,
@@ -686,7 +750,7 @@ def get_health_score(
         "email_count":            email_count,
         "transcript_count":       transcript_count,
         "sentiment_status": "READY" if has_communication_data else "NOT_SYNCED",
-        "delivery_status": "READY" if has_jira_data else "NOT_SYNCED",
+        "delivery_status": "READY" if active_sprint else ("NO_ACTIVE_SPRINT" if has_jira_data else "NOT_SYNCED"),
     }
 
 
@@ -705,12 +769,15 @@ def get_health_summary(
     baseline = float(payload.get("baseline", baseline_score()))
     delivery = abs(float(payload.get("delivery_deduction", 0.0)))
     communication = abs(float(payload.get("communication_deduction", 0.0)))
+    canonical_score = round(float(payload["health_score"]), 2)
     payload.update({
         "baseline_score": baseline,
         "communication_deduction_pts": communication,
         "delivery_deduction_pts": delivery,
         "total_deduction_pts": round(communication + delivery, 2),
-        "health_score": round(max(0.0, baseline - communication - delivery), 2),
+        "health_score": canonical_score,
+        "final_health_score": canonical_score,
+        "rag_status": _rag_for_score(canonical_score, payload["green_threshold"], payload["red_threshold"]),
         "shap_feature_deductions": [
             {"key": key, "deduction_pts": abs(float(value))}
             for key, value in payload.get("breakdown", {}).items()
@@ -735,7 +802,7 @@ def get_dashboard_health(project_id: int, db: Session = Depends(get_db), current
             total_open_issues=latest.open_issues, overdue_issues=snapshot.get("overdue_issue_count", latest.overdue_rate * latest.open_issues), open_bugs=latest.open_bugs,
             has_jira_data=has_jira_data, has_communication_data=has_communication_data,
         )
-        score, source = round(float(latest.health_score), 2), getattr(latest, "prediction_source", None) or "Deterministic Fallback Engine"
+        score, source = _canonical_snapshot_score(latest), getattr(latest, "prediction_source", None) or "Deterministic Fallback Engine"
         recorded = latest.recorded_at
     else:
         processed = prepare_advanced_features(snapshot, tone_score=None, is_brand_new=True, has_jira_data=False, has_communication_data=False)
@@ -766,13 +833,18 @@ def _evidence_counts(project_id: int, db: Session) -> tuple[int, int]:
 def get_ai_insights(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project = _get_project_for_user(project_id, current_user, db)
     emails, transcripts = _evidence_counts(project_id, db)
-    return AIInsightsService.insights(project, _latest_project_score(project_id, db), emails, transcripts)
+    latest = _latest_project_score(project_id, db)
+    canonical_score = _canonical_snapshot_score(latest)
+    latest.health_score = canonical_score
+    latest.rag_status = _rag_for_score(canonical_score, project.green_threshold, project.red_threshold)
+    return AIInsightsService.insights(project, latest, emails, transcripts)
 
 @router.get("/{project_id}/explainability")
 def get_explainability(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project = _get_project_for_user(project_id, current_user, db)
-    emails, transcripts = _evidence_counts(project_id, db)
-    latest = db.query(HealthScore).filter(HealthScore.project_id == project_id).order_by(HealthScore.recorded_at.desc()).first()
+    snapshots = (db.query(HealthScore).filter(HealthScore.project_id == project_id)
+                 .order_by(HealthScore.recorded_at.asc()).all())
+    latest = snapshots[-1] if snapshots else None
     if latest is None:
         # An unstarted project is explainable: its dashboard starts at the
         # clean 100-point baseline rather than returning a cold-start 404.
@@ -783,8 +855,11 @@ def get_explainability(project_id: int, db: Session = Depends(get_db), current_u
             feature_vector=baseline["features"], prediction_source="Deterministic Fallback Engine",
             rag_status="GREEN", divergence_flag=0,
         )
-    observations = db.query(HealthScore).filter(HealthScore.project_id == project_id).count()
-    return ExplainabilityService.build(project, latest, emails, transcripts, observations)
+    else:
+        canonical_score = _canonical_snapshot_score(latest)
+        latest.health_score = canonical_score
+        latest.rag_status = _rag_for_score(canonical_score, project.green_threshold, project.red_threshold)
+    return ExplainabilityService.build(project, latest, snapshots)
 
 
 @router.post("/{project_id}/health-simulation")
@@ -797,13 +872,29 @@ def simulate_health(project_id: int, body: HealthSimulationRequest, db: Session 
 @router.get("/{project_id}/decision-support")
 def get_decision_support(project_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project = _get_project_for_user(project_id, current_user, db); emails, transcripts = _evidence_counts(project_id, db)
-    return DecisionSupportService.build(project, _latest_project_score(project_id, db), email_count=emails, transcript_count=transcripts, capacity_analysis=_live_capacity_analysis(project))
+    capacity = None
+    try:
+        capacity = _live_capacity_analysis(project)
+    except HTTPException:
+        # Decision support remains useful for communication-only projects;
+        # the response explicitly marks Jira-dependent recommendations absent.
+        pass
+    latest = _latest_project_score(project_id, db)
+    latest.health_score = _canonical_snapshot_score(latest)
+    return DecisionSupportService.build(project, latest, email_count=emails, transcript_count=transcripts, capacity_analysis=capacity)
 
 
 @router.post("/{project_id}/decision-support/simulate")
 def simulate_decision_support(project_id: int, body: HealthSimulationRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     project = _get_project_for_user(project_id, current_user, db); emails, transcripts = _evidence_counts(project_id, db)
-    return DecisionSupportService.build(project, _latest_project_score(project_id, db), body.dict(), email_count=emails, transcript_count=transcripts, capacity_analysis=_live_capacity_analysis(project))
+    capacity = None
+    try:
+        capacity = _live_capacity_analysis(project)
+    except HTTPException:
+        pass
+    latest = _latest_project_score(project_id, db)
+    latest.health_score = _canonical_snapshot_score(latest)
+    return DecisionSupportService.build(project, latest, body.dict(), email_count=emails, transcript_count=transcripts, capacity_analysis=capacity)
 
 
 def _live_capacity_analysis(project: Project) -> dict:

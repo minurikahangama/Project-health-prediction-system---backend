@@ -85,6 +85,7 @@ def _evaluation(project_id: int, user: User, db: Session) -> dict:
         project, scores[-1], scores,
         db.query(ProcessedEmail).filter_by(project_id=project.id).all(),
         db.query(TranscriptUpload).filter_by(project_id=project.id).all(),
+        db,
     )
 
 
@@ -92,14 +93,26 @@ def _evaluation_pdf(evaluation: dict) -> bytes:
     """Small dependency-free PDF suitable for the research appendix."""
     def escape(value):
         return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    summary = evaluation.get("summary") or {}
+    ai_model = evaluation.get("ai_model_evaluation") or {}
+    ask_phps = evaluation.get("ask_phps_validation") or {}
     lines = ["PHPS System Evaluation Report", f"Generated: {evaluation['generated_at']}", "",
-             f"Overall PHPS Accuracy: {evaluation.get('overall_phps_accuracy') if evaluation.get('overall_phps_accuracy') is not None else 'Unavailable'}%",
+             f"Overall PHPS Accuracy: {summary.get('overall_phps_accuracy') if summary.get('overall_phps_accuracy') is not None else evaluation.get('overall_phps_accuracy') if evaluation.get('overall_phps_accuracy') is not None else 'Unavailable'}%",
+             f"Health Score Accuracy: {summary.get('health_score_accuracy') if summary.get('health_score_accuracy') is not None else 'Unavailable'}%",
+             f"Dashboard Consistency: {summary.get('dashboard_consistency') if summary.get('dashboard_consistency') is not None else 'Unavailable'}%",
+             f"AI Accuracy: {summary.get('ai_accuracy') if summary.get('ai_accuracy') is not None else 'Unavailable'}%",
+             f"Functional Success Rate: {summary.get('functional_success_rate') if summary.get('functional_success_rate') is not None else evaluation.get('functional_success_rate') if evaluation.get('functional_success_rate') is not None else 'Unavailable'}%",
+             f"API Success Rate: {summary.get('api_success_rate') if summary.get('api_success_rate') is not None else evaluation.get('api_validation', {}).get('success_rate', 'Unavailable')}%",
+             f"Prediction Accuracy: {summary.get('prediction_accuracy') if summary.get('prediction_accuracy') is not None else 'Unavailable'}%",
+             f"Forecast Accuracy: {summary.get('forecast_accuracy') if summary.get('forecast_accuracy') is not None else 'Unavailable'}%",
+             f"Capacity Accuracy: {summary.get('capacity_accuracy') if summary.get('capacity_accuracy') is not None else evaluation['capacity_validation'].get('capacity_accuracy') if evaluation['capacity_validation'].get('capacity_accuracy') is not None else 'Unavailable'}%",
+             f"Recommendation Accuracy: {summary.get('recommendation_accuracy') if summary.get('recommendation_accuracy') is not None else evaluation['decision_support_validation'].get('recommendation_accuracy') if evaluation['decision_support_validation'].get('recommendation_accuracy') is not None else 'Unavailable'}%",
+             f"Reliability: {summary.get('reliability') if summary.get('reliability') is not None else evaluation['reliability'].get('reliability') if evaluation['reliability'].get('reliability') is not None else 'Unavailable'}%",
              f"Health Score Validation: {evaluation['health_score_validation']['status']}",
-             f"Dashboard Consistency: {evaluation['dashboard_consistency']['consistency_score']}%",
-             f"Functional Success Rate: {evaluation.get('functional_success_rate') if evaluation.get('functional_success_rate') is not None else 'Unavailable'}%",
-             f"Capacity Accuracy: {evaluation['capacity_validation'].get('capacity_accuracy') if evaluation['capacity_validation'].get('capacity_accuracy') is not None else 'Unavailable'}%",
              f"TreeSHAP Validation: {evaluation['treeshap_validation']['status']}",
-             f"Reliability: {evaluation['reliability'].get('reliability') if evaluation['reliability'].get('reliability') is not None else 'Unavailable'}%",
+             f"Ask PHPS: {ask_phps.get('status', 'Unavailable')}",
+             f"RoBERTa evaluation: {ai_model.get('roberta', {}).get('status', 'Unavailable')}",
+             f"XGBoost evaluation: {ai_model.get('xgboost', {}).get('status', 'Unavailable')}",
              "", "Method note: unavailable metrics require labelled outcomes or completed sprint data and are not estimated."]
     stream = "BT /F1 11 Tf 50 760 Td " + " ".join(f"({escape(line)}) Tj 0 -18 Td" for line in lines) + " ET"
     objects = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", f"<< /Length {len(stream.encode('latin-1', 'replace'))} >>\nstream\n{stream}\nendstream"]

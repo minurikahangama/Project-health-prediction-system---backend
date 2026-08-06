@@ -121,7 +121,8 @@ class HostedLLM(LLMProvider):
     def __init__(self):
         self._local = LocalLLM()
 
-    def _complete(self, system: str, prompt: str, max_tokens: int = 700) -> str:
+    def _complete(self, system: str, prompt: str, max_tokens: int = 700,
+                  response_json: bool = False) -> str:
         raise NotImplementedError
 
     def classify_in_scope(self, question: str) -> bool:
@@ -169,7 +170,8 @@ class AnthropicLLM(HostedLLM):
         self._client = anthropic.Anthropic()
         self._model = model
 
-    def _complete(self, system: str, prompt: str, max_tokens: int = 700) -> str:
+    def _complete(self, system: str, prompt: str, max_tokens: int = 700,
+                  response_json: bool = False) -> str:
         msg = self._client.messages.create(
             model=self._model, max_tokens=max_tokens, system=system,
             messages=[{"role": "user", "content": prompt}],
@@ -192,14 +194,16 @@ class GeminiLLM(HostedLLM):
         self._client = genai.Client(api_key=key)
         self._model = model
 
-    def _complete(self, system: str, prompt: str, max_tokens: int = 700) -> str:
+    def _complete(self, system: str, prompt: str, max_tokens: int = 700,
+                  response_json: bool = False) -> str:
         from google.genai import types  # lazy import
+        cfg = dict(system_instruction=system, max_output_tokens=max_tokens, temperature=0.0)
+        if response_json:
+            # Force strict JSON output so the sprint-plan parser never fails.
+            cfg["response_mime_type"] = "application/json"
         resp = self._client.models.generate_content(
-            model=self._model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system, max_output_tokens=max_tokens, temperature=0.0,
-            ),
+            model=self._model, contents=prompt,
+            config=types.GenerateContentConfig(**cfg),
         )
         return (resp.text or "").strip()
 

@@ -10,6 +10,7 @@ the local folder source stands in for those.
 from __future__ import annotations
 
 import re
+from html import unescape
 from typing import Dict, List, Optional
 
 import httpx
@@ -20,10 +21,13 @@ _TAG = re.compile(r"<[^>]+>")
 
 
 def _html_to_text(html: str) -> str:
-    text = re.sub(r"<(br|/p|/div|/li|/h[1-6])\s*/?>", "\n", html, flags=re.I)
+    # Mark headings so the chunker can detect sections (used for citations and
+    # sprint-plan feature extraction).
+    text = re.sub(r"<h[1-6][^>]*>", "\n## ", html, flags=re.I)
+    text = re.sub(r"<(br|/p|/div|/li|/h[1-6])\s*/?>", "\n", text, flags=re.I)
     text = _TAG.sub("", text)
-    text = re.sub(r"&nbsp;", " ", text)
-    text = re.sub(r"&amp;", "&", text)
+    text = unescape(text)                       # &mdash; &amp; &#39; &nbsp; -> real chars
+    text = text.replace(" ", " ")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 

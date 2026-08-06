@@ -119,6 +119,43 @@ def chat(project_id: int, body: ChatRequest, db: Session = Depends(get_db),
     )
 
 
+class SprintPlanRequest(BaseModel):
+    document: Optional[str] = None          # requirement page_id or title
+    developer_count: int = 3
+    sprint_length_weeks: int = 2
+    hours_per_developer: Optional[int] = None
+
+
+@router.get("/projects/{project_id}/documents")
+def list_documents(project_id: int, doc_type: Optional[str] = None,
+                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """List the project's synced documents (optionally filtered by type)."""
+    try:
+        docs = KnowledgeAssistant(db).list_documents(user, project_id, doc_type)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    return {"documents": docs}
+
+
+@router.post("/projects/{project_id}/sprint-plan")
+def sprint_plan(project_id: int, body: SprintPlanRequest,
+                db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Generate a requirement-driven sprint plan (FR-19)."""
+    if user.role not in ("super_admin", "org_admin", "pm"):
+        raise HTTPException(status_code=403, detail="Not allowed to plan sprints.")
+    try:
+        return KnowledgeAssistant(db).generate_sprint_plan(
+            user, project_id, document=body.document,
+            developer_count=body.developer_count,
+            sprint_length_weeks=body.sprint_length_weeks,
+            hours_per_developer=body.hours_per_developer,
+        )
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 @router.get("/projects/{project_id}/conversations")
 def list_conversations(project_id: int, db: Session = Depends(get_db),
                        user: User = Depends(get_current_user)):

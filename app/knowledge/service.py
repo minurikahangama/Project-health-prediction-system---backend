@@ -165,6 +165,37 @@ class KnowledgeAssistant:
         self.db.refresh(conv)
         return conv
 
+    # ── Documents & sprint planning (FR-19) ──────────────────────────────
+    def list_documents(self, user: User, project_id: int,
+                       doc_type: Optional[str] = None) -> List[dict]:
+        if project_id not in self.allowed_project_ids(user):
+            raise AuthorizationError("Not authorized to view this project.")
+        from app.knowledge.models import KbDocumentChunk
+        q = self.db.query(KbDocumentChunk.page_id, KbDocumentChunk.page_title,
+                          KbDocumentChunk.doc_type).filter(
+            KbDocumentChunk.project_id == project_id)
+        if doc_type:
+            q = q.filter(KbDocumentChunk.doc_type == doc_type)
+        seen, out = set(), []
+        for page_id, title, dt in q.all():
+            if page_id in seen:
+                continue
+            seen.add(page_id)
+            out.append({"page_id": page_id, "title": title or page_id, "doc_type": dt})
+        return out
+
+    def generate_sprint_plan(self, user: User, project_id: int, *,
+                             document: Optional[str], developer_count: int,
+                             sprint_length_weeks: int = 2,
+                             hours_per_developer: Optional[int] = None) -> dict:
+        if project_id not in self.allowed_project_ids(user):
+            raise AuthorizationError("Not authorized to plan this project.")
+        from app.knowledge.sprint_planner import SprintPlanner
+        hours = hours_per_developer or sprint_length_weeks * 30
+        planner = SprintPlanner(self.db, self.llm, self.config)
+        return planner.plan(project_id, document, developer_count,
+                            sprint_length_weeks, hours)
+
     # ── History ──────────────────────────────────────────────────────────
     def list_conversations(self, user: User, project_id: int) -> List[dict]:
         if project_id not in self.allowed_project_ids(user):

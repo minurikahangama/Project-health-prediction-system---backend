@@ -12,6 +12,7 @@ psycopg2-binary==2.9.9
 # ── Authentication ─────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 
 # ── ML / NLP ───────────────────────────────────────────────────
 torch>=2.4,<2.6
@@ -36,5 +37,13 @@ slowapi==0.1.9
 # ── Utilities ─────────────────────────────────────────────────
 python-dateutil==2.9.0
 
-# ── Typer pinned to resolve spacy vs fastapi-cli conflict ─────
-typer==0.9.4
+# ── Typer: satisfies spacy (<1.0.0,>=0.3.0) and fastapi-cli (>=0.16.0) ─
+typer>=0.16.0,<1.0.0
+
+# ── FR-13: Agentic Document Assistant (RAG over Confluence + LangGraph) ─
+langgraph>=0.2,<0.3
+langchain-core>=0.3,<0.4
+google-genai>=1.0             # KB_LLM_PROVIDER=gemini (uses GEMINI_API_KEY)
+# Optional alternative providers (offline defaults work without them):
+#   sentence-transformers>=2.7   # KB_EMBEDDING_PROVIDER=sentence-transformers
+#   anthropic>=0.39              # KB_LLM_PROVIDER=anthropic

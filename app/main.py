@@ -24,10 +24,11 @@ from slowapi.errors import RateLimitExceeded
 
 from app.utils.database import engine, SessionLocal
 from app.models import models
+from app.knowledge import models as kb_models  # noqa: F401 — register FR-13 tables on Base
 from app.services.project_health import PredictionService
 
 # Import all routers
-from app.api import auth, projects, pipeline, client, admin, profile, intelligence
+from app.api import auth, projects, pipeline, client, admin, profile, intelligence, knowledge
 from app.routes import analytics
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -219,6 +220,7 @@ app.include_router(client.router,   prefix="/client",   tags=["Client"])
 app.include_router(admin.router,    prefix="/admin",    tags=["Admin"])
 app.include_router(profile.router,  prefix="/profile",  tags=["Profile"])
 app.include_router(analytics.router, prefix="/api", tags=["Analytics"])
+app.include_router(knowledge.router, prefix="/knowledge", tags=["Knowledge Assistant (FR-13)"])
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

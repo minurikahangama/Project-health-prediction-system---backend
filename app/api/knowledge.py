@@ -119,6 +119,28 @@ def chat(project_id: int, body: ChatRequest, db: Session = Depends(get_db),
     )
 
 
+@router.get("/projects/{project_id}/conversations")
+def list_conversations(project_id: int, db: Session = Depends(get_db),
+                       user: User = Depends(get_current_user)):
+    """List the user's past conversations for a project (newest first)."""
+    try:
+        convs = KnowledgeAssistant(db).list_conversations(user, project_id)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    return {"conversations": convs}
+
+
+@router.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: int, db: Session = Depends(get_db),
+                        user: User = Depends(get_current_user)):
+    """Delete one of the user's conversations."""
+    try:
+        KnowledgeAssistant(db).delete_conversation(user, conversation_id)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"deleted": True}
+
+
 @router.get("/conversations/{conversation_id}/messages")
 def conversation_messages(conversation_id: int, db: Session = Depends(get_db),
                           user: User = Depends(get_current_user)):

@@ -165,6 +165,43 @@ class KnowledgeAssistant:
         self.db.refresh(conv)
         return conv
 
+    # ── History ──────────────────────────────────────────────────────────
+    def list_conversations(self, user: User, project_id: int) -> List[dict]:
+        if project_id not in self.allowed_project_ids(user):
+            raise AuthorizationError("Not authorized to view this project.")
+        convs = (self.db.query(KbConversation)
+                     .filter(KbConversation.user_id == user.id,
+                             KbConversation.project_id == project_id)
+                     .order_by(KbConversation.created_at.desc()).all())
+        out: List[dict] = []
+        for c in convs:
+            first = (self.db.query(KbMessage)
+                         .filter(KbMessage.conversation_id == c.id,
+                                 KbMessage.role == "user")
+                         .order_by(KbMessage.created_at).first())
+            count = (self.db.query(KbMessage)
+                         .filter(KbMessage.conversation_id == c.id).count())
+            if count == 0:
+                continue   # skip empty threads
+            title = (first.content[:60] if first else "New conversation").strip()
+            out.append({"id": c.id, "title": title or "New conversation",
+                        "created_at": str(c.created_at), "message_count": count})
+        return out
+
+    def delete_conversation(self, user: User, conversation_id: int) -> None:
+        conv = self.db.query(KbConversation).get(conversation_id)
+        if conv is None or conv.user_id != user.id:
+            raise AuthorizationError("Conversation not found.")
+        # Remove dependent rows explicitly so it works on any database backend.
+        (self.db.query(KbReasoningTrace)
+             .filter(KbReasoningTrace.conversation_id == conversation_id)
+             .delete(synchronize_session=False))
+        (self.db.query(KbMessage)
+             .filter(KbMessage.conversation_id == conversation_id)
+             .delete(synchronize_session=False))
+        self.db.delete(conv)
+        self.db.commit()
+
     # ── Ask ──────────────────────────────────────────────────────────────
     def answer(self, user: User, project_id: int, question: str,
                conversation_id: Optional[int] = None,

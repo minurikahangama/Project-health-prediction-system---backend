@@ -197,15 +197,26 @@ class GeminiLLM(HostedLLM):
     def _complete(self, system: str, prompt: str, max_tokens: int = 700,
                   response_json: bool = False) -> str:
         from google.genai import types  # lazy import
-        cfg = dict(system_instruction=system, max_output_tokens=max_tokens, temperature=0.0)
+        base = dict(system_instruction=system, max_output_tokens=max_tokens, temperature=0.0)
         if response_json:
-            # Force strict JSON output so the sprint-plan parser never fails.
-            cfg["response_mime_type"] = "application/json"
-        resp = self._client.models.generate_content(
-            model=self._model, contents=prompt,
-            config=types.GenerateContentConfig(**cfg),
-        )
-        return (resp.text or "").strip()
+            base["response_mime_type"] = "application/json"  # force strict JSON
+
+        def _run(cfg: dict) -> str:
+            resp = self._client.models.generate_content(
+                model=self._model, contents=prompt,
+                config=types.GenerateContentConfig(**cfg))
+            return (resp.text or "").strip()
+
+        # For JSON tasks, disable "thinking" so the full token budget goes to the
+        # actual output (2.5 models otherwise spend tokens thinking and truncate).
+        if response_json:
+            try:
+                cfg = dict(base)
+                cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                return _run(cfg)
+            except Exception:
+                pass  # SDK/model may not support thinking_config — fall through
+        return _run(base)
 
 
 # Per-provider default model when KB_LLM_MODEL is not set explicitly.

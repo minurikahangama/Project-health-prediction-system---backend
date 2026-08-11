@@ -138,15 +138,23 @@ class HostedLLM(LLMProvider):
 
     def generate(self, question: str, passages: List[Dict]) -> Dict:
         context = "\n\n".join(
-            f"[{i}] ({p['doc_type']} · {p.get('section') or p['page_id']})\n{p['content']}"
+            f"[{i}] (doc: {p.get('page_title') or p['page_id']} · type: {p['doc_type']}"
+            f"{' · section: ' + p['section'] if p.get('section') else ''})\n{p['content']}"
             for i, p in enumerate(passages)
         )
         system = (
-            "You are a project documentation assistant. Answer ONLY from the "
-            "provided passages. If they do not contain the answer, reply exactly "
-            "'NOT_AVAILABLE'. Cite passages inline like [0], [1]."
+            "You are a project documentation assistant. The passages below are "
+            "excerpts from the project's own documents; each is tagged with its "
+            "document name ('doc:'), type, and section. Answer the user's question "
+            "using ONLY these passages. When the user asks about, or to summarise or "
+            "describe, a named document, treat the passages tagged with that document "
+            "name as its content and answer from them — do not refuse just because the "
+            "passages don't repeat the document's name. Reply exactly 'NOT_AVAILABLE' "
+            "only when the passages genuinely lack the information. Cite passages "
+            "inline like [0], [1]."
         )
-        answer = self._complete(system, f"Passages:\n{context}\n\nQuestion: {question}\n\nAnswer:")
+        answer = self._complete(system, f"Passages:\n{context}\n\nQuestion: {question}\n\nAnswer:",
+                                 max_tokens=2048)
         if "NOT_AVAILABLE" in answer.upper():
             return {"answer": answer, "used": []}
         used = sorted({int(m) for m in re.findall(r"\[(\d+)\]", answer)
@@ -207,15 +215,16 @@ class GeminiLLM(HostedLLM):
                 config=types.GenerateContentConfig(**cfg))
             return (resp.text or "").strip()
 
-        # For JSON tasks, disable "thinking" so the full token budget goes to the
-        # actual output (2.5 models otherwise spend tokens thinking and truncate).
-        if response_json:
-            try:
-                cfg = dict(base)
-                cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-                return _run(cfg)
-            except Exception:
-                pass  # SDK/model may not support thinking_config — fall through
+        # Disable "thinking" so the full token budget goes to the actual output.
+        # Gemini 2.5 models otherwise spend the budget thinking and truncate the
+        # answer mid-sentence — this hits chat answers and JSON alike. Grounded,
+        # temperature-0 tasks (RAG answers, query rewrite, JSON plans) don't need it.
+        try:
+            cfg = dict(base)
+            cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            return _run(cfg)
+        except Exception:
+            pass  # SDK/model may not support thinking_config — fall through
         return _run(base)
 
 

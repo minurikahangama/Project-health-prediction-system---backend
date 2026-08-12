@@ -175,7 +175,15 @@ class HostedLLM(LLMProvider):
             "name as its content and answer from them — do not refuse just because the "
             "passages don't repeat the document's name. Reply exactly 'NOT_AVAILABLE' "
             "only when the passages genuinely lack the information. Cite passages "
-            "inline like [0], [1]."
+            "inline like [0], [1]. "
+            "When the answer describes a flow, process, sequence of steps, architecture, "
+            "or state transitions, ALSO include a small Mermaid diagram in a ```mermaid "
+            "fenced block (use 'flowchart TD' or 'sequenceDiagram') so the reader can see "
+            "it at a glance. Use the exact names/roles from the passages, keep it to a "
+            "handful of nodes, and put it after a short text explanation. Always wrap "
+            "every node label in double quotes, e.g. A[\"User logs in\"], so punctuation "
+            "like parentheses or slashes cannot break the diagram. For simple factual "
+            "answers, do not add a diagram."
         )
         answer = self._complete(system, f"Passages:\n{context}\n\nQuestion: {question}\n\nAnswer:",
                                  max_tokens=2048)
@@ -211,7 +219,12 @@ class HostedLLM(LLMProvider):
             "question practically — outline concrete steps, approaches, libraries, and "
             "trade-offs. Tie the guidance back to the project's requirement when the "
             "context is relevant. Cite web sources inline like [W0], [W1] and project "
-            "context like [D0]. If the web results do not cover the question, say so briefly."
+            "context like [D0]. If the web results do not cover the question, say so briefly. "
+            "When it aids understanding — an architecture, request/data flow, or sequence "
+            "of interactions — ALSO include a small Mermaid diagram in a ```mermaid fenced "
+            "block ('flowchart TD' or 'sequenceDiagram'), placed after the explanation. "
+            "Wrap every Mermaid node label in double quotes, e.g. A[\"Client\"], so "
+            "punctuation cannot break the diagram."
         )
         prompt = (f"PROJECT CONTEXT:\n{doc_ctx or '(none)'}\n\n"
                   f"WEB RESULTS:\n{web_ctx or '(none)'}\n\n"

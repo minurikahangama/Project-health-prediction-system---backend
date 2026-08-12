@@ -13,6 +13,7 @@ class ChatState(TypedDict, total=False):
     active_project_id: int
     allowed_project_ids: List[int]
     doc_types: Optional[List[str]]
+    web_search: bool                  # user toggled "Search the web" for this question
 
     # Working state
     authorized: bool
@@ -21,11 +22,12 @@ class ChatState(TypedDict, total=False):
     best_score: float
     attempts: int
     grounded: bool
+    web_results: List[dict]
 
     # Outputs
     answer: str
     citations: List[dict]
-    status: str                       # answered | not_available | denied | out_of_scope
+    status: str                       # answered | web_answered | not_available | denied | out_of_scope
 
     # Audit — accumulated across nodes
     trace: Annotated[List[dict], operator.add]

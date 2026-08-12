@@ -40,6 +40,12 @@ class KnowledgeConfig:
     chunk_chars: int = int(_get("KB_CHUNK_CHARS", "700"))
     chunk_overlap: int = int(_get("KB_CHUNK_OVERLAP", "120"))
 
+    # Web search (Tavily) — powers the assistant's optional "Search the web" toggle.
+    # Empty key → web search stays disabled and the toggle degrades gracefully.
+    tavily_api_key: str = _get("TAVILY_API_KEY", "")
+    web_max_results: int = int(_get("KB_WEB_MAX_RESULTS", "5"))
+    web_context_top_k: int = int(_get("KB_WEB_CONTEXT_TOP_K", "3"))
+
 
 def load_config() -> KnowledgeConfig:
     return KnowledgeConfig()

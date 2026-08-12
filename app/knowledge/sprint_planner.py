@@ -17,9 +17,12 @@ Two engines: hosted LLM (Gemini) primary; deterministic heuristic fallback
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict
 from typing import List, Optional
+
+logger = logging.getLogger("phps.sprint_planner")
 
 from sqlalchemy.orm import Session
 
@@ -269,16 +272,16 @@ def _feature_subtasks(base: int) -> List[dict]:
     ]
 
 
-def _make_task(name: str, body: str, section: str, dev: str, nfrs: List[dict]) -> dict:
+def _make_task(name: str, body: str, section: str, dev: str, nfrs: List[dict],
+               deps: Optional[List[str]] = None) -> dict:
     base = _estimate(body)
-    subtasks = _feature_subtasks(base)
+    impl = _feature_subtasks(base)
+    total = sum(s["estimate_hours"] for s in impl)   # NFRs carry no effort
     applied = _applicable_nfrs(name + " " + body, nfrs)
-    for n in applied:
-        subtasks.append({"title": f"Meet {n['label']}", "type": "nfr",
-                         "estimate_hours": 2, "detail": n["detail"]})
-    total = sum(s["estimate_hours"] for s in subtasks)
+    subtasks = impl + [{"title": f"Meet {n['label']}", "type": "nfr",
+                        "estimate_hours": 0, "detail": n["detail"]} for n in applied]
     return {"title": name, "description": body[:150], "estimate_hours": total,
-            "assigned_developer": dev, "dependencies": [], "source_section": section,
+            "assigned_developer": dev, "dependencies": deps or [], "source_section": section,
             "subtasks": subtasks, "nfrs": [n["label"] for n in applied]}
 
 
@@ -310,6 +313,10 @@ def _heuristic_plan(extracted: dict, team: List[str], capacity: int,
     for f in extracted["foundation"]:
         sprint0.append(_make_task(f["name"], f["body"], f["section"], theme_dev.get(_theme_of(f["name"]), data_dev), nfrs))
 
+    # Foundation task titles that feature tasks depend on.
+    api_dep = "Consolidated API skeleton"
+    has_auth_gw = any(t["title"] == "Authentication groundwork" for t in sprint0)
+
     # Functional tasks → later sprints. Themed features keep the same developer
     # (affinity); generic features are spread round-robin to balance the load.
     feature_tasks: List[dict] = []
@@ -321,7 +328,10 @@ def _heuristic_plan(extracted: dict, team: List[str], capacity: int,
             generic_i += 1
         else:
             dev = theme_dev[theme]
-        feature_tasks.append(_make_task(f["name"], f["body"], f["section"], dev, nfrs))
+        deps = [api_dep]
+        if theme == "Authentication" and has_auth_gw:
+            deps.append("Authentication groundwork")
+        feature_tasks.append(_make_task(f["name"], f["body"], f["section"], dev, nfrs, deps))
 
     # Pack per developer into capacity-sized sprint buckets.
     dev_tasks: dict = defaultdict(list)
@@ -364,7 +374,51 @@ def _sprint(name: str, tasks: List[dict]) -> dict:
     return {"name": name, "tasks": tasks, "total_by_developer": dict(totals)}
 
 
+def _enforce_dependencies(sprints: List[dict]) -> List[dict]:
+    """Reorder tasks so none appears before a task it depends on. A task whose
+    dependency lands in a later sprint is pushed down to that dependency's sprint."""
+    def index() -> dict:
+        m: dict = {}
+        for i, sp in enumerate(sprints):
+            for t in sp["tasks"]:
+                m.setdefault(t["title"], i)
+                if t.get("source_section"):
+                    m.setdefault(t["source_section"], i)
+        return m
+
+    for _ in range(6):
+        idx = index()
+        changed = False
+        for i, sp in enumerate(sprints):
+            for t in list(sp["tasks"]):
+                dep_sprints = [idx[d] for d in (t.get("dependencies") or []) if d in idx]
+                if not dep_sprints:
+                    continue
+                latest = max(dep_sprints)
+                if latest > i:                     # scheduled before its dependency
+                    while len(sprints) <= latest:
+                        sprints.append({"name": "", "tasks": [], "total_by_developer": {}})
+                    sp["tasks"].remove(t)
+                    sprints[latest]["tasks"].append(t)
+                    changed = True
+        if not changed:
+            break
+
+    # Drop empty sprints (keep Sprint 0) and renumber sequentially.
+    kept = [sprints[0]] + [sp for sp in sprints[1:] if sp["tasks"]]
+    for i, sp in enumerate(kept):
+        sp["name"] = f"Sprint {i}"
+    return kept
+
+
 def _assemble(document, team, weeks, capacity, sprints, nfrs) -> dict:
+    sprints = _enforce_dependencies(sprints)
+    for sp in sprints:                                   # recompute totals after moves
+        totals: dict = defaultdict(int)
+        for t in sp["tasks"]:
+            totals[t["assigned_developer"]] += t["estimate_hours"]
+        sp["total_by_developer"] = dict(totals)
+
     summary: dict = defaultdict(lambda: {"total_hours": 0, "areas": set()})
     for sp in sprints:
         for t in sp["tasks"]:
@@ -394,8 +448,8 @@ def _assemble(document, team, weeks, capacity, sprints, nfrs) -> dict:
 def _llm_plan(llm: HostedLLM, doc_text: str, team: List[str], capacity: int,
               weeks: int, document: str, nfrs: List[dict]) -> Optional[dict]:
     schema = ('{"sprints":[{"name":"Sprint 0","tasks":[{"title":"...","description":"...",'
-              '"assigned_developer":"dev1","source_section":"...","subtasks":['
-              '{"title":"Backend implementation","type":"impl","estimate_hours":6},'
+              '"assigned_developer":"dev1","source_section":"...","dependencies":["<title of a task this needs first>"],'
+              '"subtasks":[{"title":"Backend implementation","type":"impl","estimate_hours":6},'
               '{"title":"Meet NFR-01 Performance","type":"nfr","estimate_hours":2}]}]}]}')
     system = (
         "You are an expert software delivery lead. Produce a sprint plan as STRICT JSON "
@@ -412,18 +466,24 @@ def _llm_plan(llm: HostedLLM, doc_text: str, team: List[str], capacity: int,
         "then use as many sprints as needed to cover all requirements. (6) Assign tasks "
         f"across exactly {team}; group related tasks under the same developer; no developer "
         f"exceeds {capacity} hours per sprint. (7) Every task references its requirement "
-        "section in 'source_section'."
+        "section in 'source_section'. (8) In 'dependencies', list the exact titles of other "
+        "tasks that must be finished first (e.g. a frontend/UI task depends on its API task; "
+        "a dashboard depends on its integration task). A dependency must be scheduled in an "
+        "earlier or the same sprint. Use [] when there are no dependencies."
     )
     prompt = (f"Requirement document:\n{doc_text[:24000]}\n\nDevelopers: {team}\n"
               f"Sprint length: {weeks} weeks\nHours per developer per sprint: {capacity}\n\n"
               f"Plan ALL functional requirements found above. "
               f"Return JSON exactly in this shape: {schema}")
     try:
-        raw = llm._complete(system, prompt, max_tokens=16000, response_json=True)
-    except Exception:
+        raw = llm._complete(system, prompt, max_tokens=32000, response_json=True)
+    except Exception as exc:
+        logger.warning("Sprint-plan LLM call failed, using heuristic: %s", exc)
         return None
     data = _parse_json(raw)
     if not data or not isinstance(data.get("sprints"), list) or not data["sprints"]:
+        logger.warning("Sprint-plan LLM output unusable (len=%d), using heuristic. Head: %.300s",
+                       len(raw or ""), raw or "")
         return None
     sprints = []
     for sp in data["sprints"]:
@@ -431,13 +491,15 @@ def _llm_plan(llm: HostedLLM, doc_text: str, team: List[str], capacity: int,
         for t in sp.get("tasks", []):
             subs = []
             for s in (t.get("subtasks") or []):
+                is_nfr = s.get("type") == "nfr"
                 subs.append({"title": str(s.get("title", "Subtask")),
-                             "type": "nfr" if s.get("type") == "nfr" else "impl",
-                             "estimate_hours": int(s.get("estimate_hours", 4) or 4),
+                             "type": "nfr" if is_nfr else "impl",
+                             # NFRs are acceptance criteria, not effort → no hours.
+                             "estimate_hours": 0 if is_nfr else int(s.get("estimate_hours", 4) or 4),
                              "detail": str(s.get("detail", ""))})
             if not subs:
                 subs = [{"title": "Implementation", "type": "impl", "estimate_hours": 8}]
-            total = sum(s["estimate_hours"] for s in subs)
+            total = sum(s["estimate_hours"] for s in subs if s["type"] == "impl")
             tasks.append({
                 "title": str(t.get("title", "Task")), "description": str(t.get("description", "")),
                 "estimate_hours": total,

@@ -39,6 +39,8 @@ class LLMProvider:
     def rewrite_query(self, question: str) -> str: ...
     def generate(self, question: str, passages: List[Dict]) -> Dict: ...
     def check_grounding(self, answer: str, passages: List[Dict]) -> bool: ...
+    def generate_web(self, question: str, web_results: List[Dict],
+                     doc_passages: List[Dict]) -> Dict: ...
 
 
 class LocalLLM(LLMProvider):
@@ -108,6 +110,28 @@ class LocalLLM(LLMProvider):
         unsupported = answer_words - corpus
         return len(unsupported) == 0
 
+    def generate_web(self, question: str, web_results: List[Dict],
+                     doc_passages: List[Dict]) -> Dict:
+        # Offline mode: no synthesis — stitch the most relevant web snippets
+        # together extractively so the feature still returns something usable.
+        if not web_results:
+            return {"answer": "", "used_web": [], "used_docs": []}
+        q = set(_content_words(question))
+        scored = sorted(
+            ((len(q & set(_content_words(r.get("content", "")))), i)
+             for i, r in enumerate(web_results)),
+            reverse=True,
+        )
+        parts, used_web = [], []
+        for _score, idx in scored[:3]:
+            snippet = _SENT.split((web_results[idx].get("content") or "").strip())
+            text = " ".join(snippet[:2]).strip()
+            if text:
+                parts.append(text)
+                used_web.append(idx)
+        return {"answer": " ".join(parts), "used_web": used_web,
+                "used_docs": list(range(min(2, len(doc_passages))))}
+
 
 class HostedLLM(LLMProvider):
     """Shared prompt logic for API-backed providers (Anthropic, Gemini, ...).
@@ -138,15 +162,23 @@ class HostedLLM(LLMProvider):
 
     def generate(self, question: str, passages: List[Dict]) -> Dict:
         context = "\n\n".join(
-            f"[{i}] ({p['doc_type']} · {p.get('section') or p['page_id']})\n{p['content']}"
+            f"[{i}] (doc: {p.get('page_title') or p['page_id']} · type: {p['doc_type']}"
+            f"{' · section: ' + p['section'] if p.get('section') else ''})\n{p['content']}"
             for i, p in enumerate(passages)
         )
         system = (
-            "You are a project documentation assistant. Answer ONLY from the "
-            "provided passages. If they do not contain the answer, reply exactly "
-            "'NOT_AVAILABLE'. Cite passages inline like [0], [1]."
+            "You are a project documentation assistant. The passages below are "
+            "excerpts from the project's own documents; each is tagged with its "
+            "document name ('doc:'), type, and section. Answer the user's question "
+            "using ONLY these passages. When the user asks about, or to summarise or "
+            "describe, a named document, treat the passages tagged with that document "
+            "name as its content and answer from them — do not refuse just because the "
+            "passages don't repeat the document's name. Reply exactly 'NOT_AVAILABLE' "
+            "only when the passages genuinely lack the information. Cite passages "
+            "inline like [0], [1]."
         )
-        answer = self._complete(system, f"Passages:\n{context}\n\nQuestion: {question}\n\nAnswer:")
+        answer = self._complete(system, f"Passages:\n{context}\n\nQuestion: {question}\n\nAnswer:",
+                                 max_tokens=2048)
         if "NOT_AVAILABLE" in answer.upper():
             return {"answer": answer, "used": []}
         used = sorted({int(m) for m in re.findall(r"\[(\d+)\]", answer)
@@ -159,6 +191,41 @@ class HostedLLM(LLMProvider):
         if "NOT_AVAILABLE" in answer.upper():
             return False
         return bool(answer.strip()) and bool(passages)
+
+    def generate_web(self, question: str, web_results: List[Dict],
+                     doc_passages: List[Dict]) -> Dict:
+        web_ctx = "\n\n".join(
+            f"[W{i}] {r.get('title')} ({r.get('url')})\n{r.get('content')}"
+            for i, r in enumerate(web_results)
+        )
+        doc_ctx = "\n\n".join(
+            f"[D{i}] (doc: {p.get('page_title') or p['page_id']}"
+            f"{' · ' + p['section'] if p.get('section') else ''})\n{p['content']}"
+            for i, p in enumerate(doc_passages)
+        )
+        system = (
+            "You are a technical assistant helping a software project team. Use the "
+            "WEB RESULTS as the source of how-to / implementation knowledge, and the "
+            "PROJECT CONTEXT (excerpts from the team's own requirement/QA/bug docs) to "
+            "ground the answer in what THIS project actually needs. Answer the user's "
+            "question practically — outline concrete steps, approaches, libraries, and "
+            "trade-offs. Tie the guidance back to the project's requirement when the "
+            "context is relevant. Cite web sources inline like [W0], [W1] and project "
+            "context like [D0]. If the web results do not cover the question, say so briefly."
+        )
+        prompt = (f"PROJECT CONTEXT:\n{doc_ctx or '(none)'}\n\n"
+                  f"WEB RESULTS:\n{web_ctx or '(none)'}\n\n"
+                  f"Question: {question}\n\nAnswer:")
+        # Implementation answers include code blocks and run long — give them a
+        # generous budget so they don't truncate mid-sentence.
+        answer = self._complete(system, prompt, max_tokens=8192)
+        used_web = sorted({int(m) for m in re.findall(r"\[W(\d+)\]", answer)
+                           if int(m) < len(web_results)})
+        used_docs = sorted({int(m) for m in re.findall(r"\[D(\d+)\]", answer)
+                            if int(m) < len(doc_passages)})
+        if not used_web:                      # always attribute the web sources used
+            used_web = list(range(min(3, len(web_results))))
+        return {"answer": answer, "used_web": used_web, "used_docs": used_docs}
 
 
 class AnthropicLLM(HostedLLM):
@@ -197,15 +264,27 @@ class GeminiLLM(HostedLLM):
     def _complete(self, system: str, prompt: str, max_tokens: int = 700,
                   response_json: bool = False) -> str:
         from google.genai import types  # lazy import
-        cfg = dict(system_instruction=system, max_output_tokens=max_tokens, temperature=0.0)
+        base = dict(system_instruction=system, max_output_tokens=max_tokens, temperature=0.0)
         if response_json:
-            # Force strict JSON output so the sprint-plan parser never fails.
-            cfg["response_mime_type"] = "application/json"
-        resp = self._client.models.generate_content(
-            model=self._model, contents=prompt,
-            config=types.GenerateContentConfig(**cfg),
-        )
-        return (resp.text or "").strip()
+            base["response_mime_type"] = "application/json"  # force strict JSON
+
+        def _run(cfg: dict) -> str:
+            resp = self._client.models.generate_content(
+                model=self._model, contents=prompt,
+                config=types.GenerateContentConfig(**cfg))
+            return (resp.text or "").strip()
+
+        # Disable "thinking" so the full token budget goes to the actual output.
+        # Gemini 2.5 models otherwise spend the budget thinking and truncate the
+        # answer mid-sentence — this hits chat answers and JSON alike. Grounded,
+        # temperature-0 tasks (RAG answers, query rewrite, JSON plans) don't need it.
+        try:
+            cfg = dict(base)
+            cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            return _run(cfg)
+        except Exception:
+            pass  # SDK/model may not support thinking_config — fall through
+        return _run(base)
 
 
 # Per-provider default model when KB_LLM_MODEL is not set explicitly.

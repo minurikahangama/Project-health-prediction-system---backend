@@ -21,6 +21,7 @@ from app.knowledge.models import (
 )
 from app.knowledge.providers.embeddings import build_embedding_provider
 from app.knowledge.providers.llm import build_llm_provider
+from app.knowledge.providers.web_search import build_web_search_provider
 from app.knowledge.vector_index import VectorIndex
 from app.knowledge.ingestion import Ingestor, SyncStats
 from app.knowledge.agent import AgentRuntime, build_agent
@@ -39,9 +40,10 @@ class KnowledgeAssistant:
         self.config = config or load_config()
         self.embedder = build_embedding_provider(self.config)
         self.llm = build_llm_provider(self.config)
+        self.web = build_web_search_provider(self.config)
         self.retriever = VectorIndex(db, self.embedder)
         self.ingestor = Ingestor(db, self.embedder, self.config)
-        self.runtime = AgentRuntime(self.retriever, self.llm, self.config)
+        self.runtime = AgentRuntime(self.retriever, self.llm, self.config, self.web)
         self.agent = build_agent(self.runtime)
 
     # ── Authorization ────────────────────────────────────────────────────
@@ -236,7 +238,8 @@ class KnowledgeAssistant:
     # ── Ask ──────────────────────────────────────────────────────────────
     def answer(self, user: User, project_id: int, question: str,
                conversation_id: Optional[int] = None,
-               doc_types: Optional[List[str]] = None) -> dict:
+               doc_types: Optional[List[str]] = None,
+               web_search: bool = False) -> dict:
         allowed = self.allowed_project_ids(user)
         conv = self._get_or_create_conversation(user, project_id, conversation_id)
 
@@ -250,6 +253,7 @@ class KnowledgeAssistant:
             "active_project_id": project_id,
             "allowed_project_ids": allowed,
             "doc_types": doc_types,
+            "web_search": web_search,
             "attempts": 0,
             "trace": [],
         }

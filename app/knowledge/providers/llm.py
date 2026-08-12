@@ -39,6 +39,8 @@ class LLMProvider:
     def rewrite_query(self, question: str) -> str: ...
     def generate(self, question: str, passages: List[Dict]) -> Dict: ...
     def check_grounding(self, answer: str, passages: List[Dict]) -> bool: ...
+    def generate_web(self, question: str, web_results: List[Dict],
+                     doc_passages: List[Dict]) -> Dict: ...
 
 
 class LocalLLM(LLMProvider):
@@ -108,6 +110,28 @@ class LocalLLM(LLMProvider):
         unsupported = answer_words - corpus
         return len(unsupported) == 0
 
+    def generate_web(self, question: str, web_results: List[Dict],
+                     doc_passages: List[Dict]) -> Dict:
+        # Offline mode: no synthesis — stitch the most relevant web snippets
+        # together extractively so the feature still returns something usable.
+        if not web_results:
+            return {"answer": "", "used_web": [], "used_docs": []}
+        q = set(_content_words(question))
+        scored = sorted(
+            ((len(q & set(_content_words(r.get("content", "")))), i)
+             for i, r in enumerate(web_results)),
+            reverse=True,
+        )
+        parts, used_web = [], []
+        for _score, idx in scored[:3]:
+            snippet = _SENT.split((web_results[idx].get("content") or "").strip())
+            text = " ".join(snippet[:2]).strip()
+            if text:
+                parts.append(text)
+                used_web.append(idx)
+        return {"answer": " ".join(parts), "used_web": used_web,
+                "used_docs": list(range(min(2, len(doc_passages))))}
+
 
 class HostedLLM(LLMProvider):
     """Shared prompt logic for API-backed providers (Anthropic, Gemini, ...).
@@ -167,6 +191,41 @@ class HostedLLM(LLMProvider):
         if "NOT_AVAILABLE" in answer.upper():
             return False
         return bool(answer.strip()) and bool(passages)
+
+    def generate_web(self, question: str, web_results: List[Dict],
+                     doc_passages: List[Dict]) -> Dict:
+        web_ctx = "\n\n".join(
+            f"[W{i}] {r.get('title')} ({r.get('url')})\n{r.get('content')}"
+            for i, r in enumerate(web_results)
+        )
+        doc_ctx = "\n\n".join(
+            f"[D{i}] (doc: {p.get('page_title') or p['page_id']}"
+            f"{' · ' + p['section'] if p.get('section') else ''})\n{p['content']}"
+            for i, p in enumerate(doc_passages)
+        )
+        system = (
+            "You are a technical assistant helping a software project team. Use the "
+            "WEB RESULTS as the source of how-to / implementation knowledge, and the "
+            "PROJECT CONTEXT (excerpts from the team's own requirement/QA/bug docs) to "
+            "ground the answer in what THIS project actually needs. Answer the user's "
+            "question practically — outline concrete steps, approaches, libraries, and "
+            "trade-offs. Tie the guidance back to the project's requirement when the "
+            "context is relevant. Cite web sources inline like [W0], [W1] and project "
+            "context like [D0]. If the web results do not cover the question, say so briefly."
+        )
+        prompt = (f"PROJECT CONTEXT:\n{doc_ctx or '(none)'}\n\n"
+                  f"WEB RESULTS:\n{web_ctx or '(none)'}\n\n"
+                  f"Question: {question}\n\nAnswer:")
+        # Implementation answers include code blocks and run long — give them a
+        # generous budget so they don't truncate mid-sentence.
+        answer = self._complete(system, prompt, max_tokens=8192)
+        used_web = sorted({int(m) for m in re.findall(r"\[W(\d+)\]", answer)
+                           if int(m) < len(web_results)})
+        used_docs = sorted({int(m) for m in re.findall(r"\[D(\d+)\]", answer)
+                            if int(m) < len(doc_passages)})
+        if not used_web:                      # always attribute the web sources used
+            used_web = list(range(min(3, len(web_results))))
+        return {"answer": answer, "used_web": used_web, "used_docs": used_docs}
 
 
 class AnthropicLLM(HostedLLM):

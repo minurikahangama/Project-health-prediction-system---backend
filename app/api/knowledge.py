@@ -27,6 +27,7 @@ class ChatRequest(BaseModel):
     question: str
     conversation_id: Optional[int] = None
     doc_types: Optional[List[str]] = None
+    web_search: bool = False
 
 
 class ConfluenceConnectionRequest(BaseModel):
@@ -116,6 +117,7 @@ def chat(project_id: int, body: ChatRequest, db: Session = Depends(get_db),
     return assistant.answer(
         user=user, project_id=project_id, question=body.question,
         conversation_id=body.conversation_id, doc_types=body.doc_types,
+        web_search=body.web_search,
     )
 
 

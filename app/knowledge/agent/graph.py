@@ -15,20 +15,25 @@ from langgraph.graph import StateGraph, START, END
 from app.knowledge.agent.state import ChatState
 from app.knowledge.config import KnowledgeConfig
 from app.knowledge.providers.llm import LLMProvider
+from app.knowledge.providers.web_search import WebSearchProvider
 from app.knowledge.vector_index import VectorIndex
 
 NOT_AVAILABLE_MSG = "I could not find this information in the project's documents."
 DENIED_MSG = "You are not authorized to access this project."
 OUT_OF_SCOPE_MSG = "I can only answer questions about this project's documentation."
+WEB_DISABLED_MSG = "Web search is not configured. Add a TAVILY_API_KEY to enable it."
+WEB_EMPTY_MSG = "I couldn't find anything useful on the web for that question."
 
 
 class AgentRuntime:
     """Holds the retriever + LLM and exposes each graph node as a method."""
 
-    def __init__(self, retriever: VectorIndex, llm: LLMProvider, config: KnowledgeConfig):
+    def __init__(self, retriever: VectorIndex, llm: LLMProvider, config: KnowledgeConfig,
+                 web: WebSearchProvider | None = None):
         self.retriever = retriever
         self.llm = llm
         self.config = config
+        self.web = web or WebSearchProvider()
 
     # ── Nodes ────────────────────────────────────────────────────────────
     def authorize(self, state: ChatState) -> dict:
@@ -105,9 +110,53 @@ class AgentRuntime:
         return {"answer": NOT_AVAILABLE_MSG, "citations": [], "status": "not_available",
                 "trace": [{"step": "not_available", "detail": {}}]}
 
+    def web_search(self, state: ChatState) -> dict:
+        """User toggled 'Search the web'. Pull light project context for grounding,
+        run a Tavily search, and synthesise an implementation-oriented answer."""
+        question = state.get("original_question", state["question"])
+        if not self.web.enabled:
+            return {"answer": WEB_DISABLED_MSG, "citations": [], "status": "not_available",
+                    "trace": [{"step": "web_search", "detail": {"enabled": False}}]}
+
+        # Best-effort project context (no relevance gate — it's only for grounding).
+        doc_passages = [p.as_dict() for p in self.retriever.search(
+            project_id=state["active_project_id"], query=question,
+            top_k=self.config.web_context_top_k, doc_types=state.get("doc_types"))]
+        results = self.web.search(question, max_results=self.config.web_max_results)
+        if not results:
+            return {"answer": WEB_EMPTY_MSG, "citations": [], "status": "not_available",
+                    "trace": [{"step": "web_search",
+                               "detail": {"enabled": True, "web_results": 0}}]}
+
+        web_dicts = [r.as_dict() for r in results]
+        gen = self.llm.generate_web(question, web_dicts, doc_passages)
+        citations = [{
+            "page_id": web_dicts[i]["url"], "page_title": web_dicts[i]["title"],
+            "section": None, "doc_type": "web", "url": web_dicts[i]["url"],
+        } for i in gen.get("used_web", []) if i < len(web_dicts)]
+        citations += [{
+            "page_id": doc_passages[i]["page_id"],
+            "page_title": doc_passages[i].get("page_title"),
+            "section": doc_passages[i].get("section"),
+            "doc_type": doc_passages[i]["doc_type"],
+        } for i in gen.get("used_docs", []) if i < len(doc_passages)]
+        return {
+            "answer": gen.get("answer", "") or WEB_EMPTY_MSG,
+            "citations": citations,
+            "status": "web_answered" if gen.get("answer") else "not_available",
+            "web_results": web_dicts,
+            "trace": [{"step": "web_search", "detail": {
+                "enabled": True, "web_results": len(web_dicts),
+                "doc_context": len(doc_passages)}}],
+        }
+
     # ── Routers ──────────────────────────────────────────────────────────
     def _route_after_authorize(self, state: ChatState) -> str:
-        return "grade_question" if state.get("authorized") else "deny"
+        if not state.get("authorized"):
+            return "deny"
+        if state.get("web_search"):
+            return "web_answer"
+        return "grade_question"
 
     def _route_after_grade_question(self, state: ChatState) -> str:
         return "retrieve" if state.get("in_scope") else "out_of_scope"
@@ -138,10 +187,13 @@ def build_agent(runtime: AgentRuntime):
     g.add_node("check_grounding", runtime.check_grounding)
     g.add_node("respond", runtime.respond)
     g.add_node("not_available", runtime.not_available)
+    g.add_node("web_answer", runtime.web_search)
 
     g.add_edge(START, "authorize")
     g.add_conditional_edges("authorize", runtime._route_after_authorize,
-                            {"grade_question": "grade_question", "deny": "deny"})
+                            {"grade_question": "grade_question", "web_answer": "web_answer",
+                             "deny": "deny"})
+    g.add_edge("web_answer", END)
     g.add_edge("deny", END)
     g.add_conditional_edges("grade_question", runtime._route_after_grade_question,
                             {"retrieve": "retrieve", "out_of_scope": "out_of_scope"})
